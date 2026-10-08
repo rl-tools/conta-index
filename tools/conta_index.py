@@ -28,19 +28,23 @@ def warn(message):
     print(f"warning: {message}", file=sys.stderr)
 
 
+def read_json(path):
+    return json.loads(path.read_bytes().decode("utf-8"))
+
+
 def lines_json(items):
     return "[\n" + ",\n".join(json.dumps(item, ensure_ascii=False) for item in items) + "\n]"
 
 
 def load_meta():
-    meta = json.loads(META.read_text())
+    meta = read_json(META)
     if meta.get("format") != 1 or (meta.get("index") or {}).get("location") != INDEX_LOCATION:
         fail(f"meta.json: expected format 1 and index.location \"{INDEX_LOCATION}\"")
     return meta
 
 
 def load_shard_table():
-    shards = json.loads(SHARD_TABLE.read_text())
+    shards = read_json(SHARD_TABLE)
     if not shards:
         fail("shards.json: no shards")
     for shard, spec in shards.items():
@@ -52,7 +56,7 @@ def load_shard_table():
 
 def load_shard(shard):
     path = SHARDS / f"{shard}.json"
-    entries = json.loads(path.read_text()) if path.exists() else []
+    entries = read_json(path) if path.exists() else []
     previous = ""
     for entry in entries:
         sha1 = entry.get("sha1", "")
@@ -66,7 +70,7 @@ def load_shard(shard):
 
 def save_shard(shard, entries):
     entries.sort(key=lambda entry: entry["sha1"])
-    (SHARDS / f"{shard}.json").write_text(lines_json(entries) + "\n")
+    (SHARDS / f"{shard}.json").write_bytes((lines_json(entries) + "\n").encode("utf-8"))
 
 
 def combine(shards):
@@ -94,25 +98,26 @@ def combine(shards):
 def generate():
     meta = load_meta()
     entries, text = combine(load_shard_table())
-    meta["index"]["sha256"] = hashlib.sha256(text.encode()).hexdigest()
-    return entries, text, json.dumps(meta, indent=2) + "\n"
+    index_bytes = text.encode("utf-8")
+    meta["index"]["sha256"] = hashlib.sha256(index_bytes).hexdigest()
+    return entries, index_bytes, (json.dumps(meta, indent=2) + "\n").encode("utf-8"), meta["index"]["sha256"]
 
 
 def build():
-    entries, text, meta_text = generate()
+    entries, index_bytes, meta_bytes, index_sha256 = generate()
     INDEX.parent.mkdir(exist_ok=True)
-    INDEX.write_text(text)
-    META.write_text(meta_text)
-    print(f"{INDEX}: {len(entries)} entries, sha256 {meta_text.split(chr(34))[-2][:12]}… written to meta.json")
+    INDEX.write_bytes(index_bytes)
+    META.write_bytes(meta_bytes)
+    print(f"{INDEX}: {len(entries)} entries, sha256 {index_sha256[:12]}… written to meta.json")
 
 
 def check():
-    entries, text, meta_text = generate()
-    if not INDEX.exists() or INDEX.read_text() != text:
-        fail(f"{INDEX_LOCATION} is stale or hand-edited: run tools/conta_index.py build")
-    if META.read_text() != meta_text:
-        fail("meta.json index.sha256 is stale: run tools/conta_index.py build")
-    print(f"ok: {len(json.loads(SHARD_TABLE.read_text()))} shards, {len(entries)} entries")
+    entries, index_bytes, meta_bytes, index_sha256 = generate()
+    if not INDEX.exists() or INDEX.read_bytes() != index_bytes:
+        fail(f"{INDEX_LOCATION} is stale, hand-edited or re-encoded (line endings, encoding): run tools/conta_index.py build")
+    if META.read_bytes() != meta_bytes:
+        fail("meta.json index.sha256 is stale, or meta.json was re-encoded: run tools/conta_index.py build")
+    print(f"ok: {len(read_json(SHARD_TABLE))} shards, {len(entries)} entries, index sha256 {index_sha256[:12]}…")
 
 
 def digests(path):
@@ -129,7 +134,7 @@ def descriptions_from_metadata(checkout):
     if not path.exists():
         return {}
     descriptions = {}
-    for entry in json.loads(path.read_text()):
+    for entry in read_json(path):
         sha1 = str(entry.get("hash", "")).lower()
         if not SHA1.match(sha1):
             warn(f"{path}: invalid hash {entry.get('hash')!r}")

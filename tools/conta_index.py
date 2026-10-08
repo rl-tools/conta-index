@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """scan: add the blobs of a shard checkout (<checkout>/data/<sha1>, descriptions from an optional metadata.json) to shards/<shard>.json, then build.
-build: combine shards.json and shards/*.json into generated/index.json and write its sha256 into meta.json. check: validate everything and fail if the generated files are stale or hand-edited."""
+build: for every version/<n>/, combine its shards.json with the shared shards/*.json into version/<n>/generated/index.json and write its sha256 into version/<n>/meta.json.
+check: validate everything and fail if any generated file is stale, hand-edited or re-encoded."""
 
 import hashlib
 import json
@@ -9,11 +10,11 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-META = ROOT / "meta.json"
-SHARD_TABLE = ROOT / "shards.json"
 SHARDS = ROOT / "shards"
-INDEX = ROOT / "generated" / "index.json"
-INDEX_LOCATION = INDEX.relative_to(ROOT).as_posix()
+VERSIONS = ROOT / "version"
+CURRENT = ROOT / "current.json"
+INDEX_LOCATION = "generated/index.json"
+VERSION_NAME = re.compile(r"^[1-9][0-9]*$")
 SHA1 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 LFS_POINTER = b"version https://git-lfs"
@@ -36,21 +37,23 @@ def lines_json(items):
     return "[\n" + ",\n".join(json.dumps(item, ensure_ascii=False) for item in items) + "\n]"
 
 
-def load_meta():
-    meta = read_json(META)
-    if meta.get("format") != 1 or (meta.get("index") or {}).get("location") != INDEX_LOCATION:
-        fail(f"meta.json: expected format 1 and index.location \"{INDEX_LOCATION}\"")
+def load_meta(directory, version):
+    path = directory / "meta.json"
+    meta = read_json(path)
+    if type(meta.get("format")) is not int or meta["format"] != version or (meta.get("index") or {}).get("location") != INDEX_LOCATION:
+        fail(f"{path}: expected format {version} and index.location \"{INDEX_LOCATION}\"")
     return meta
 
 
-def load_shard_table():
-    shards = read_json(SHARD_TABLE)
+def load_shard_table(directory):
+    path = directory / "shards.json"
+    shards = read_json(path)
     if not shards:
-        fail("shards.json: no shards")
+        fail(f"{path}: no shards")
     for shard, spec in shards.items():
         url = spec.get("url", "")
         if not spec.get("type") or ("{sha1}" not in url and "{sha256}" not in url):
-            fail(f"shards.json: shard {shard} needs a type and a url with {{sha1}} or {{sha256}}")
+            fail(f"{path}: shard {shard} needs a type and a url with {{sha1}} or {{sha256}}")
     return shards
 
 
@@ -95,29 +98,57 @@ def combine(shards):
     return entries, "{\n\"shards\": {\n" + table + "\n},\n\"entries\": " + lines_json(entries) + "\n}\n"
 
 
-def generate():
-    meta = load_meta()
-    entries, text = combine(load_shard_table())
+def generate_format_1(directory):
+    meta = load_meta(directory, 1)
+    entries, text = combine(load_shard_table(directory))
     index_bytes = text.encode("utf-8")
     meta["index"]["sha256"] = hashlib.sha256(index_bytes).hexdigest()
     return entries, index_bytes, (json.dumps(meta, indent=2) + "\n").encode("utf-8"), meta["index"]["sha256"]
 
 
+GENERATORS = {1: generate_format_1}
+
+
+def versions():
+    found = {}
+    for directory in sorted(VERSIONS.iterdir()):
+        if directory.name.startswith("."):
+            continue
+        if not directory.is_dir() or not VERSION_NAME.match(directory.name):
+            fail(f"{directory}: everything in version/ is a directory named by a positive integer")
+        found[int(directory.name)] = directory
+    if not found:
+        fail(f"{VERSIONS} contains no versions")
+    for version in found:
+        if version not in GENERATORS:
+            fail(f"{found[version]}: tools/conta_index.py has no generator for version {version}")
+    return dict(sorted(found.items()))
+
+
 def build():
-    entries, index_bytes, meta_bytes, index_sha256 = generate()
-    INDEX.parent.mkdir(exist_ok=True)
-    INDEX.write_bytes(index_bytes)
-    META.write_bytes(meta_bytes)
-    print(f"{INDEX}: {len(entries)} entries, sha256 {index_sha256[:12]}… written to meta.json")
+    for version, directory in versions().items():
+        entries, index_bytes, meta_bytes, index_sha256 = GENERATORS[version](directory)
+        index = directory / INDEX_LOCATION
+        index.parent.mkdir(exist_ok=True)
+        index.write_bytes(index_bytes)
+        (directory / "meta.json").write_bytes(meta_bytes)
+        print(f"{index}: {len(entries)} entries, sha256 {index_sha256[:12]}… written to {directory / 'meta.json'}")
 
 
 def check():
-    entries, index_bytes, meta_bytes, index_sha256 = generate()
-    if not INDEX.exists() or INDEX.read_bytes() != index_bytes:
-        fail(f"{INDEX_LOCATION} is stale, hand-edited or re-encoded (line endings, encoding): run tools/conta_index.py build")
-    if META.read_bytes() != meta_bytes:
-        fail("meta.json index.sha256 is stale, or meta.json was re-encoded: run tools/conta_index.py build")
-    print(f"ok: {len(read_json(SHARD_TABLE))} shards, {len(entries)} entries, index sha256 {index_sha256[:12]}…")
+    available = versions()
+    for version, directory in available.items():
+        entries, index_bytes, meta_bytes, index_sha256 = GENERATORS[version](directory)
+        index = directory / INDEX_LOCATION
+        if not index.exists() or index.read_bytes() != index_bytes:
+            fail(f"{index} is stale, hand-edited or re-encoded (line endings, encoding): run tools/conta_index.py build")
+        if (directory / "meta.json").read_bytes() != meta_bytes:
+            fail(f"{directory / 'meta.json'}: index.sha256 is stale, or the file was re-encoded: run tools/conta_index.py build")
+        print(f"ok: version {version}, {len(read_json(directory / 'shards.json'))} shards, {len(entries)} entries, index sha256 {index_sha256[:12]}…")
+    if CURRENT.exists():
+        current = read_json(CURRENT).get("version")
+        if type(current) is not int or current not in available:
+            fail(f"{CURRENT}: version {current!r} is not one of {list(available)}")
 
 
 def digests(path):
@@ -146,8 +177,8 @@ def descriptions_from_metadata(checkout):
 
 
 def scan(shard, checkout):
-    if shard not in load_shard_table():
-        fail(f"{shard} is not in shards.json")
+    if not any(shard in load_shard_table(directory) for directory in versions().values()):
+        fail(f"{shard} is in no version/<n>/shards.json")
     checkout = Path(checkout).expanduser().resolve()
     data = checkout / "data"
     if not data.is_dir():

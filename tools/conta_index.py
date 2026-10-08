@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""scan: add the blobs of a shard checkout (<checkout>/data/<sha1>, descriptions from an optional metadata.json) to shards/<shard>.json, then build.
+"""ingest: copy files into <checkout>/data/<sha1>, append their paths as descriptions to <checkout>/metadata.json, then scan.
+scan: add the blobs of a shard checkout (<checkout>/data/<sha1>, descriptions from an optional metadata.json) to shards/<shard>.json, then build.
 build: for every version/<n>/, combine its shards.json with the shared shards/*.json into version/<n>/generated/index.json and write its sha256 into version/<n>/meta.json.
 check: validate everything and fail if any generated file is stale, hand-edited or re-encoded."""
 
 import hashlib
 import json
 import re
+import shutil
 import sys
 from pathlib import Path
 
@@ -60,19 +62,25 @@ def load_shard_table(directory):
 def load_shard(shard):
     path = SHARDS / f"{shard}.json"
     entries = read_json(path) if path.exists() else []
-    previous = ""
+    seen = set()
     for entry in entries:
         sha1 = entry.get("sha1", "")
         if not SHA1.match(sha1) or not SHA256.match(entry.get("sha256", "")):
             fail(f"{path}: bad digests in {entry}")
-        if sha1 <= previous:
-            fail(f"{path}: {sha1} out of order or duplicated")
-        previous = sha1
+        if sha1 in seen:
+            fail(f"{path}: {sha1} is listed twice")
+        seen.add(sha1)
     return entries
 
 
+def shard_order(entry):
+    description = entry.get("description", "")
+    parts = re.split(r"([0-9]+)", description)
+    return [(1, int(part)) if part.isdigit() else (0, part.casefold()) for part in parts], description, entry["sha1"]
+
+
 def save_shard(shard, entries):
-    entries.sort(key=lambda entry: entry["sha1"])
+    entries.sort(key=shard_order)
     (SHARDS / f"{shard}.json").write_bytes((lines_json(entries) + "\n").encode("utf-8"))
 
 
@@ -176,9 +184,61 @@ def descriptions_from_metadata(checkout):
     return descriptions
 
 
-def scan(shard, checkout):
+def require_listed(shard):
     if not any(shard in load_shard_table(directory) for directory in versions().values()):
         fail(f"{shard} is in no version/<n>/shards.json")
+
+
+def description_for(file):
+    path = Path(file)
+    return path.name if path.is_absolute() or ".." in path.parts else path.as_posix()
+
+
+def append_metadata(path, additions):
+    """Append entries in the file's one-per-line style, aligning "hash" with the last entry, so the hand-kept formatting survives."""
+    text = path.read_bytes().decode("utf-8") if path.exists() else "[\n]\n"
+    end = text.rfind("]")
+    if end < 0:
+        fail(f"{path}: not a JSON array")
+    head = text[:end].rstrip()
+    last_line = head.split("\n")[-1]
+    hash_column = last_line.find('"hash"') if last_line.lstrip().startswith("{") else -1
+    lines = []
+    for description, sha1 in additions:
+        prefix = '{"description": ' + json.dumps(description, ensure_ascii=False) + ","
+        lines.append(prefix + " " * max(hash_column - len(prefix), 1) + '"hash": "' + sha1 + '"}')
+    separator = "\n" if head.endswith("[") else ",\n"
+    path.write_bytes((head + separator + ",\n".join(lines) + "\n" + text[end:]).encode("utf-8"))
+    read_json(path)
+
+
+def ingest(shard, checkout, files):
+    require_listed(shard)
+    checkout = Path(checkout).expanduser().resolve()
+    data = checkout / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    descriptions = descriptions_from_metadata(checkout)
+    additions = []
+    for file in files:
+        if not Path(file).is_file():
+            fail(f"{file} is not a file")
+        sha1, _ = digests(file)
+        if not (data / sha1).exists():
+            shutil.copyfile(file, data / sha1)
+        description = description_for(file)
+        if sha1 in descriptions:
+            if descriptions[sha1] != description:
+                warn(f"{file}: {sha1} is already described as {descriptions[sha1]!r}, keeping that")
+            continue
+        descriptions[sha1] = description
+        additions.append((description, sha1))
+    if additions:
+        append_metadata(checkout / "metadata.json", additions)
+    scan(shard, checkout)
+
+
+def scan(shard, checkout):
+    require_listed(shard)
     checkout = Path(checkout).expanduser().resolve()
     data = checkout / "data"
     if not data.is_dir():
@@ -211,10 +271,12 @@ def scan(shard, checkout):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) == 4 and sys.argv[1] == "scan":
+    if len(sys.argv) >= 5 and sys.argv[1] == "ingest":
+        ingest(sys.argv[2], sys.argv[3], sys.argv[4:])
+    elif len(sys.argv) == 4 and sys.argv[1] == "scan":
         scan(sys.argv[2], sys.argv[3])
     elif len(sys.argv) == 2 and sys.argv[1] in ("build", "check"):
         globals()[sys.argv[1]]()
     else:
-        print(f"usage: {sys.argv[0]} scan <shard> <checkout> | build | check", file=sys.stderr)
+        print(f"usage: {sys.argv[0]} ingest <shard> <checkout> <file>... | scan <shard> <checkout> | build | check", file=sys.stderr)
         sys.exit(1)

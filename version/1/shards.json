@@ -3,5 +3,10 @@
     "type": "huggingface",
     "url": "https://huggingface.co/datasets/rl-tools/conta/resolve/main/data/{sha1}",
     "repo": "https://huggingface.co/datasets/rl-tools/conta"
+  },
+  "procthor": {
+    "type": "huggingface",
+    "url": "https://huggingface.co/datasets/conta-shards/procthor/resolve/main/data/{sha1}",
+    "repo": "https://huggingface.co/datasets/conta-shards/procthor"
   }
 }

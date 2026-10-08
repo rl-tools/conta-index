@@ -5,10 +5,18 @@ Which shard holds each conta blob. Consumers never read this repository directly
 - `version/<n>/` — one directory per contract version. Every version stays published and keeps being generated from the shared shard files for as long as the store exists, so a client hardcodes its version; extensions go into a new version. `tools/conta_index.py` has one generator per version and refuses a version directory it has no generator for.
 - `version/<n>/meta.json` — hand-written except `index.sha256`: `format` (equal to `<n>`), `index` (`location`, and `sha256` of the generated index written by `build`).
 - `version/<n>/shards.json` — hand-written shard table, id → `{type, url, repo}` in order of preference. `url` is the http transport, a template with `{sha1}` or `{sha256}`, so a changed download location is an edit here and no client update. `type` pre-empts transports where inserting a hash into a url is not enough; a new type needs a client that knows it. `repo` is informational.
-- `shards/<id>.json` — source of truth per shard, shared by all versions: entries `{sha1, sha256, description}` sorted by `sha1`, one per line. Edit by hand or run `tools/conta_index.py scan <id> <checkout>`, which adds every `data/<sha1>` of a shard checkout, verifies it hashes to its name, takes descriptions from the checkout's optional `metadata.json`, and rebuilds.
+- `shards/<id>.json` — source of truth per shard, shared by all versions: entries `{sha1, sha256, description}` sorted by description with numbers compared by value (`Train-2` before `Train-10`), one per line; `scan` restores the order. Edit by hand or run `tools/conta_index.py scan <id> <checkout>`, which adds every `data/<sha1>` of a shard checkout, verifies it hashes to its name, takes descriptions from the checkout's optional `metadata.json`, and rebuilds.
 - `version/<n>/generated/index.json` — written by `tools/conta_index.py build`, never edited: the shard table plus `entries` `{sha1, sha256, shards, description}` merged across shards. Committed so the raw GitHub URL serves it; `tools/conta_index.py check` (also the CI workflow) fails when it or `index.sha256` does not match the sources.
 
 A shard is a directory of blobs named by their sha1 and nothing else is required of it. Never delete or rewrite a blob in a shard; the index is append-only, so a newer index never has fewer entries.
+
+To ingest files into a new shard `<name>`, add `<name>` to `version/1/shards.json` with the url template under which `<checkout>/data` will be hosted, then run from the repository root:
+
+```
+python3 -I tools/conta_index.py ingest <name> <checkout> <files>
+```
+
+It copies each file to `<checkout>/data/<sha1>`, appends the file's path as given (just the file name for an absolute path) as its description to `<checkout>/metadata.json`, creates `shards/<name>.json` and rebuilds the index. A blob already described in `metadata.json` keeps its description. The same command adds files to an existing shard. Upload `<checkout>/data` and `<checkout>/metadata.json` to the host before pushing the index.
 
 ## Client contract
 

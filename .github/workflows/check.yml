@@ -6,3 +6,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python3 -I tools/conta_index.py check
+      - run: python3 -I tools/build_web.py

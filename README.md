@@ -27,4 +27,3 @@ Entry points, tried in order:
 
 A cached blob never touches the network. On a blob-cache miss the client consults its cached index; if the hash is absent or every location fails, it refreshes once: fetch `meta.json`, and only when `index.sha256` differs from the cached index fetch `index.location` (relative to `meta.json`), verify its sha256 (a CDN can briefly serve `meta.json` and the index from different commits; on mismatch retry or try the next entry point), replace the cache and retry the lookup. A lookup matches an entry by `sha1` or `sha256`; the locations are the entry's `shards` in order, each shard's `url` with the digest substituted.
 
-GitHub Pages serves the `main` branch root. A mirror on Hugging Face is `git push` of the same repository to a dataset.

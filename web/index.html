@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>conta-index</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 70rem; margin: 2rem auto; padding: 0 1rem; }
+    input, select, button { font: inherit; padding: .35rem; }
+    input { width: 28rem; max-width: 100%; box-sizing: border-box; }
+    .controls { display: flex; flex-wrap: wrap; align-items: end; gap: .75rem; }
+    .controls label { display: block; margin-bottom: .25rem; }
+    .controls > div { max-width: 100%; }
+    #search-results li { margin-bottom: 1.25rem; overflow-wrap: anywhere; }
+    #search-results code { font-size: .9rem; }
+    #search-results a { display: inline-block; margin-right: 1rem; }
+  </style>
+  <script src="search.js" defer></script>
+</head>
+<body>
+  <h1>conta-index</h1>
+  <section id="search" aria-labelledby="search-heading" hidden>
+    <h2 id="search-heading">Search blobs</h2>
+    <form id="search-form" role="search">
+      <div class="controls">
+        <div>
+          <label for="search-query">Description or hash</label>
+          <input id="search-query" type="search" aria-describedby="search-help" autocomplete="off" spellcheck="false">
+        </div>
+        <div>
+          <label for="search-scope">Search in</label>
+          <select id="search-scope">
+            <option value="all">All</option>
+            <option value="descriptions">Descriptions</option>
+            <option value="hashes">Hashes</option>
+          </select>
+        </div>
+        <button type="submit">Search</button>
+      </div>
+      <p id="search-help">Matches all space-separated terms, ignoring case. Hash fragments work too.</p>
+    </form>
+    <p id="search-status" role="status">Enter a description or hash to search.</p>
+    <button id="search-retry" type="button" hidden>Retry</button>
+    <ol id="search-results"></ol>
+    <button id="search-more" type="button" hidden>Show more</button>
+  </section>
+  <noscript><p>Search requires JavaScript. Browse the sitemap below.</p></noscript>
+  <h2>Sitemap</h2>
+  <ul>
+    <!-- sitemap -->
+  </ul>
+</body>
+</html>

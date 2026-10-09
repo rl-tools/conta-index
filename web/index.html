@@ -11,9 +11,12 @@
     .controls { display: flex; flex-wrap: wrap; align-items: end; gap: .75rem; }
     .controls label { display: block; margin-bottom: .25rem; }
     .controls > div { max-width: 100%; }
-    #search-results li { margin-bottom: 1.25rem; overflow-wrap: anywhere; }
-    #search-results code { font-size: .9rem; }
-    #search-results a { display: inline-block; margin-right: 1rem; }
+    #search-table { overflow-x: auto; margin-bottom: .75rem; }
+    #search-table table { width: 100%; min-width: 48rem; table-layout: fixed; border-collapse: collapse; font-size: .9rem; }
+    #search-table th, #search-table td { padding: .35rem .5rem; text-align: left; vertical-align: top; border-bottom: 1px solid #ddd; overflow-wrap: anywhere; }
+    #search-table th { background: #f5f5f5; }
+    #search-results code { display: block; font-size: .85rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #search-results a { display: inline-block; margin-right: .5rem; }
   </style>
   <script src="search.js" defer></script>
 </head>
@@ -41,7 +44,19 @@
     </form>
     <p id="search-status" role="status">Enter a description or hash to search.</p>
     <button id="search-retry" type="button" hidden>Retry</button>
-    <ol id="search-results"></ol>
+    <div id="search-table" role="region" aria-label="Search results" tabindex="0" hidden>
+      <table>
+        <thead>
+          <tr>
+            <th scope="col">Description</th>
+            <th scope="col">SHA-1</th>
+            <th scope="col">SHA-256</th>
+            <th scope="col">Downloads</th>
+          </tr>
+        </thead>
+        <tbody id="search-results"></tbody>
+      </table>
+    </div>
     <button id="search-more" type="button" hidden>Show more</button>
   </section>
   <noscript><p>Search requires JavaScript. Browse the sitemap below.</p></noscript>

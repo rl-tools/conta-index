@@ -5,6 +5,7 @@
   const query = document.getElementById("search-query");
   const scope = document.getElementById("search-scope");
   const status = document.getElementById("search-status");
+  const table = document.getElementById("search-table");
   const results = document.getElementById("search-results");
   const retry = document.getElementById("search-retry");
   const more = document.getElementById("search-more");
@@ -61,30 +62,33 @@
     const end = Math.min(shown + pageSize, matches.length);
     for (; shown < end; shown++) {
       const { entry } = matches[shown];
-      const item = document.createElement("li");
-      const title = document.createElement("strong");
+      const item = document.createElement("tr");
+      const title = document.createElement("td");
       title.textContent = entry.description || "No description";
       item.append(title);
-      for (const [label, hash] of [["SHA-1", entry.sha1], ["SHA-256", entry.sha256]]) {
-        const line = document.createElement("div");
+      for (const hash of [entry.sha1, entry.sha256]) {
+        const cell = document.createElement("td");
         const code = document.createElement("code");
         code.textContent = hash;
-        line.append(`${label}: `, code);
-        item.append(line);
+        code.title = hash;
+        cell.append(code);
+        item.append(cell);
       }
-      const links = document.createElement("div");
+      const links = document.createElement("td");
       for (const shard of entry.shards || []) {
         const url = downloadURL(shards?.[shard]?.url, entry);
         if (!url) continue;
         const link = document.createElement("a");
         link.href = url;
-        link.textContent = `Download from ${shard}`;
+        link.textContent = shard;
+        link.title = `Download from ${shard}`;
         links.append(link);
       }
       item.append(links);
       fragment.append(item);
     }
     results.append(fragment);
+    table.hidden = matches.length === 0;
     more.hidden = shown >= matches.length;
     status.textContent = matches.length
       ? `Showing ${shown} of ${matches.length} ${matches.length === 1 ? "match" : "matches"}.`
@@ -95,6 +99,7 @@
     const text = query.value.trim().toLowerCase();
     const selectedScope = scope.value;
     results.replaceChildren();
+    table.hidden = true;
     matches = [];
     shown = 0;
     if (!text) {
@@ -137,5 +142,6 @@
   retry.addEventListener("click", () => scheduleSearch(0));
   more.addEventListener("click", renderMore);
   document.getElementById("search").hidden = false;
+  query.focus({ preventScroll: true });
   if (query.value.trim()) scheduleSearch(0);
 })();

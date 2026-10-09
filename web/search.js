@@ -5,10 +5,13 @@
   const query = document.getElementById("search-query");
   const scope = document.getElementById("search-scope");
   const status = document.getElementById("search-status");
+  const copyStatus = document.getElementById("copy-status");
   const table = document.getElementById("search-table");
   const results = document.getElementById("search-results");
   const retry = document.getElementById("search-retry");
   const more = document.getElementById("search-more");
+  const sortButtons = document.querySelectorAll(".sort-column");
+  const naturalOrder = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
   const pageSize = 50;
   let indexPromise;
   let timer;
@@ -16,6 +19,8 @@
   let matches = [];
   let shown = 0;
   let shards = {};
+  let sortColumn = "sha1";
+  let sortDirection = 1;
 
   function loadIndex() {
     if (!indexPromise) {
@@ -34,6 +39,7 @@
             description: (entry.description || "").toLowerCase(),
             sha1: entry.sha1.toLowerCase(),
             sha256: entry.sha256.toLowerCase(),
+            downloads: (entry.shards || []).join(" ").toLowerCase(),
           })),
         }))
         .catch(error => {
@@ -57,6 +63,33 @@
     }
   }
 
+  function updateSortHeaders() {
+    for (const button of sortButtons) {
+      const active = button.dataset.sort === sortColumn;
+      if (active) {
+        button.parentElement.setAttribute("aria-sort", sortDirection === 1 ? "ascending" : "descending");
+      } else {
+        button.parentElement.removeAttribute("aria-sort");
+      }
+      button.querySelector("span").textContent = active ? (sortDirection === 1 ? " ↑" : " ↓") : " ↕";
+      button.title = active && sortDirection === 1 ? "Sort descending" : "Sort ascending";
+    }
+  }
+
+  function sortAndRender() {
+    const compare = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+    matches.sort((a, b) => {
+      // Digests use lexical order; descriptions and shard names use natural order.
+      const order = sortColumn === "sha1" || sortColumn === "sha256"
+        ? compare(a[sortColumn], b[sortColumn])
+        : naturalOrder.compare(a[sortColumn], b[sortColumn]);
+      return (order || compare(a.sha1, b.sha1)) * sortDirection;
+    });
+    results.replaceChildren();
+    shown = 0;
+    renderMore();
+  }
+
   function renderMore() {
     const fragment = document.createDocumentFragment();
     const end = Math.min(shown + pageSize, matches.length);
@@ -66,12 +99,31 @@
       const title = document.createElement("td");
       title.textContent = entry.description || "No description";
       item.append(title);
-      for (const hash of [entry.sha1, entry.sha256]) {
+      for (const [label, hash] of [["SHA-1", entry.sha1], ["SHA-256", entry.sha256]]) {
         const cell = document.createElement("td");
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "hash-copy";
+        button.title = `Copy ${label}: ${hash}`;
+        button.setAttribute("aria-label", `Copy ${label}: ${hash}`);
         const code = document.createElement("code");
         code.textContent = hash;
-        code.title = hash;
-        cell.append(code);
+        let feedbackTimer;
+        button.addEventListener("click", async () => {
+          copyStatus.textContent = "";
+          try {
+            await navigator.clipboard.writeText(hash);
+            code.textContent = "Copied!";
+            copyStatus.textContent = `${label} copied to clipboard.`;
+          } catch {
+            code.textContent = "Copy failed";
+            copyStatus.textContent = "Could not copy to the clipboard. Select and copy the hash manually.";
+          }
+          clearTimeout(feedbackTimer);
+          feedbackTimer = setTimeout(() => { code.textContent = hash; }, 1500);
+        });
+        button.append(code);
+        cell.append(button);
         item.append(cell);
       }
       const links = document.createElement("td");
@@ -117,7 +169,7 @@
         (selectedScope !== "hashes" && row.description.includes(term)) ||
         (selectedScope !== "descriptions" && (row.sha1.includes(term) || row.sha256.includes(term)))
       ));
-      renderMore();
+      sortAndRender();
     } catch {
       if (request !== revision) return;
       status.textContent = "Could not load the search index. Retry or browse the sitemap below.";
@@ -141,6 +193,15 @@
   });
   retry.addEventListener("click", () => scheduleSearch(0));
   more.addEventListener("click", renderMore);
+  for (const button of sortButtons) {
+    button.addEventListener("click", () => {
+      sortDirection = button.dataset.sort === sortColumn ? -sortDirection : 1;
+      sortColumn = button.dataset.sort;
+      updateSortHeaders();
+      sortAndRender();
+    });
+  }
+  updateSortHeaders();
   document.getElementById("search").hidden = false;
   query.focus({ preventScroll: true });
   if (query.value.trim()) scheduleSearch(0);

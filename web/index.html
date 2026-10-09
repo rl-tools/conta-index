@@ -14,9 +14,16 @@
     #search-table { overflow-x: auto; margin-bottom: .75rem; }
     #search-table table { width: 100%; min-width: 48rem; table-layout: fixed; border-collapse: collapse; font-size: .9rem; }
     #search-table th, #search-table td { padding: .35rem .5rem; text-align: left; vertical-align: top; border-bottom: 1px solid #ddd; overflow-wrap: anywhere; }
-    #search-table th { background: #f5f5f5; }
+    #search-table th { padding: 0; background: #f5f5f5; }
+    #search-table .sort-column { display: block; width: 100%; padding: .35rem .5rem; border: 0; background: none; color: inherit; text-align: left; cursor: pointer; }
+    #search-table .sort-column:hover { background: #eee; }
+    #search-table .sort-column:focus-visible { outline: 2px solid #06c; outline-offset: -2px; }
+    #search-results .hash-copy { display: block; width: 100%; padding: 0; border: 0; background: none; color: inherit; text-align: left; cursor: pointer; }
+    #search-results .hash-copy:hover { background: #eee; }
+    #search-results .hash-copy:focus-visible { outline: 2px solid #06c; outline-offset: 2px; }
     #search-results code { display: block; font-size: .85rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     #search-results a { display: inline-block; margin-right: .5rem; }
+    .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
   </style>
   <script src="search.js" defer></script>
 </head>
@@ -43,15 +50,16 @@
       <p id="search-help">Matches all space-separated terms, ignoring case. Hash fragments work too.</p>
     </form>
     <p id="search-status" role="status">Enter a description or hash to search.</p>
+    <span id="copy-status" class="visually-hidden" role="status"></span>
     <button id="search-retry" type="button" hidden>Retry</button>
     <div id="search-table" role="region" aria-label="Search results" tabindex="0" hidden>
       <table>
         <thead>
           <tr>
-            <th scope="col">Description</th>
-            <th scope="col">SHA-1</th>
-            <th scope="col">SHA-256</th>
-            <th scope="col">Downloads</th>
+            <th scope="col"><button type="button" class="sort-column" data-sort="description">Description<span aria-hidden="true"></span></button></th>
+            <th scope="col"><button type="button" class="sort-column" data-sort="sha1">SHA-1<span aria-hidden="true"></span></button></th>
+            <th scope="col"><button type="button" class="sort-column" data-sort="sha256">SHA-256<span aria-hidden="true"></span></button></th>
+            <th scope="col"><button type="button" class="sort-column" data-sort="downloads">Downloads<span aria-hidden="true"></span></button></th>
           </tr>
         </thead>
         <tbody id="search-results"></tbody>

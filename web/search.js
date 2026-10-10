@@ -39,7 +39,7 @@
             description: (entry.description || "").toLowerCase(),
             sha1: entry.sha1.toLowerCase(),
             sha256: entry.sha256.toLowerCase(),
-            downloads: (entry.shards || []).join(" ").toLowerCase(),
+            downloads: (entry.shards || []).map(location => location.id).join(" ").toLowerCase(),
           })),
         }))
         .catch(error => {
@@ -51,12 +51,13 @@
     return indexPromise;
   }
 
-  function downloadURL(template, entry) {
+  function downloadURL(template, entry, compressed = false) {
     if (typeof template !== "string") return null;
     try {
       const url = new URL(template
         .replaceAll("{sha1}", entry.sha1)
         .replaceAll("{sha256}", entry.sha256));
+      if (compressed) url.pathname += ".gz";
       return ["https:", "http:"].includes(url.protocol) ? url.href : null;
     } catch {
       return null;
@@ -127,14 +128,16 @@
         item.append(cell);
       }
       const links = document.createElement("td");
-      for (const shard of entry.shards || []) {
-        const url = downloadURL(shards?.[shard]?.url, entry);
-        if (!url) continue;
-        const link = document.createElement("a");
-        link.href = url;
-        link.textContent = shard;
-        link.title = `Download from ${shard}`;
-        links.append(link);
+      for (const location of entry.shards || []) {
+        for (const compressed of location.gzip === true ? [false, true] : [false]) {
+          const url = downloadURL(shards?.[location.id]?.url, entry, compressed);
+          if (!url) continue;
+          const link = document.createElement("a");
+          link.href = url;
+          link.textContent = compressed ? `${location.id} (.gz)` : location.id;
+          link.title = `Download ${compressed ? "gzip" : "raw"} from ${location.id}`;
+          links.append(link);
+        }
       }
       item.append(links);
       fragment.append(item);

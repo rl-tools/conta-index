@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""ingest: copy files into <checkout>/data/<sha1>, append their paths as descriptions to <checkout>/metadata.json, then scan.
-scan: add the blobs of a shard checkout (<checkout>/data/<sha1>, descriptions from an optional metadata.json) to shards/<shard>.json, then build.
+"""ingest: store files as <checkout>/data/<sha1> and <sha1>.gz by default, append descriptions to metadata.json, then scan.
+scan: verify a shard checkout's blobs and optional gzip companions, update shards/<shard>.json, then build.
 build: for every version/<n>/, combine its shards.json with the shared shards/*.json into version/<n>/generated/index.json and write its sha256 into version/<n>/meta.json.
 check: validate everything and fail if any generated file is stale, hand-edited or re-encoded."""
 
+import argparse
+import gzip
 import hashlib
 import json
+import os
 import re
 import shutil
 import sys
+import tempfile
+import zlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -69,6 +74,8 @@ def load_shard(shard):
             fail(f"{path}: bad digests in {entry}")
         if sha1 in seen:
             fail(f"{path}: {sha1} is listed twice")
+        if type(entry.get("gzip", False)) is not bool:
+            fail(f"{path}: gzip must be a boolean for {sha1}")
         seen.add(sha1)
     return entries
 
@@ -88,15 +95,16 @@ def combine(shards):
     combined = {}
     for shard in shards:
         for entry in load_shard(shard):
+            location = {"id": shard, "gzip": entry.get("gzip", False)}
             existing = combined.get(entry["sha1"])
             if existing is None:
-                combined[entry["sha1"]] = {"sha1": entry["sha1"], "sha256": entry["sha256"], "shards": [shard], "description": entry.get("description", "")}
+                combined[entry["sha1"]] = {"sha1": entry["sha1"], "sha256": entry["sha256"], "shards": [location], "description": entry.get("description", "")}
             else:
                 if existing["sha256"] != entry["sha256"]:
-                    fail(f"{entry['sha1']}: sha256 differs between shards {existing['shards'][0]} and {shard}")
+                    fail(f"{entry['sha1']}: sha256 differs between shards {existing['shards'][0]['id']} and {shard}")
                 if entry.get("description") and existing["description"] and entry["description"] != existing["description"]:
-                    warn(f"{entry['sha1']}: description differs between shards ({existing['description']!r} from {existing['shards'][0]}, {entry['description']!r} from {shard})")
-                existing["shards"].append(shard)
+                    warn(f"{entry['sha1']}: description differs between shards ({existing['description']!r} from {existing['shards'][0]['id']}, {entry['description']!r} from {shard})")
+                existing["shards"].append(location)
                 existing["description"] = existing["description"] or entry.get("description", "")
     entries = [combined[sha1] for sha1 in sorted(combined)]
     for entry in entries:
@@ -159,13 +167,50 @@ def check():
             fail(f"{CURRENT}: version {current!r} is not one of {list(available)}")
 
 
-def digests(path):
+def digests(path, *, compressed=False):
+    """Hash original bytes, rejecting unmaterialized LFS files and invalid gzip."""
     sha1, sha256 = hashlib.sha1(), hashlib.sha256()
-    with open(path, "rb") as file:
-        for chunk in iter(lambda: file.read(1 << 20), b""):
-            sha1.update(chunk)
-            sha256.update(chunk)
+    try:
+        with open(path, "rb") as file:
+            prefix = file.read(len(LFS_POINTER))
+        if prefix == LFS_POINTER:
+            fail(f'{path} is a git-lfs pointer, run "git lfs pull" in the shard checkout')
+        if compressed and not prefix.startswith(b"\x1f\x8b"):
+            fail(f"{path}: not a gzip file")
+        with (gzip.open if compressed else open)(path, "rb") as file:
+            for chunk in iter(lambda: file.read(1 << 20), b""):
+                sha1.update(chunk)
+                sha256.update(chunk)
+    except (OSError, EOFError, zlib.error) as error:
+        fail(f"{path}: cannot read {'gzip blob' if compressed else 'blob'}: {error}")
     return sha1.hexdigest(), sha256.hexdigest()
+
+
+def verify_blob(path, expected, *, compressed=False):
+    if digests(path, compressed=compressed) != expected:
+        fail(f"{path}: {'decompressed content' if compressed else 'content'} does not match expected sha1/sha256 {expected}")
+
+
+def store_blob(source, destination, expected, *, compressed=False):
+    """Publish only complete, verified files; never overwrite an existing blob."""
+    if destination.exists():
+        verify_blob(destination, expected, compressed=compressed)
+        return
+    with tempfile.TemporaryDirectory(prefix=".ingest-", dir=destination.parent) as staging:
+        temporary = Path(staging) / destination.name
+        if compressed:
+            with open(source, "rb") as original, open(temporary, "wb") as output:
+                with gzip.GzipFile(filename="", mode="wb", fileobj=output, compresslevel=9, mtime=0) as zipped:
+                    shutil.copyfileobj(original, zipped, length=1 << 20)
+        else:
+            shutil.copyfile(source, temporary)
+        verify_blob(temporary, expected, compressed=compressed)
+        try:
+            # Same-filesystem hard link publishes atomically without replacing a
+            # blob another ingestion may have created while we were working.
+            os.link(temporary, destination)
+        except FileExistsError:
+            verify_blob(destination, expected, compressed=compressed)
 
 
 def descriptions_from_metadata(checkout):
@@ -212,7 +257,7 @@ def append_metadata(path, additions):
     read_json(path)
 
 
-def ingest(shard, checkout, files):
+def ingest(shard, checkout, files, *, compress=True):
     require_listed(shard)
     checkout = Path(checkout).expanduser().resolve()
     data = checkout / "data"
@@ -222,9 +267,12 @@ def ingest(shard, checkout, files):
     for file in files:
         if not Path(file).is_file():
             fail(f"{file} is not a file")
-        sha1, _ = digests(file)
-        if not (data / sha1).exists():
-            shutil.copyfile(file, data / sha1)
+        expected = digests(file)
+        sha1 = expected[0]
+        blob = data / sha1
+        store_blob(file, blob, expected)
+        if compress:
+            store_blob(blob, data / f"{sha1}.gz", expected, compressed=True)
         description = description_for(file)
         if sha1 in descriptions:
             if descriptions[sha1] != description:
@@ -248,17 +296,27 @@ def scan(shard, checkout):
     on_disk = set()
     for path in sorted(data.iterdir()):
         name = path.name
-        if not path.is_file() or not SHA1.match(name):
+        if name.endswith(".gz") and SHA1.fullmatch(name[:-3]):
+            if not path.is_file() or not (data / name[:-3]).is_file():
+                fail(f"{path}: gzip companions require a file and a matching raw blob")
+            continue  # Verified together with the raw blob below.
+        if not path.is_file() or not SHA1.fullmatch(name):
             warn(f"{path}: not a sha1-named blob, skipped")
             continue
-        if path.stat().st_size < 1024 and path.open("rb").read(len(LFS_POINTER)) == LFS_POINTER:
-            fail(f"{path} is a git-lfs pointer, run \"git lfs pull\" in {checkout}")
         on_disk.add(name)
+        sha1, sha256 = digests(path)
+        if sha1 != name:
+            fail(f"{path}: content hashes to {sha1}")
         if name not in entries:
-            sha1, sha256 = digests(path)
-            if sha1 != name:
-                fail(f"{path}: content hashes to {sha1}")
             entries[name] = {"sha1": sha1, "sha256": sha256, "description": ""}
+        elif entries[name]["sha256"] != sha256:
+            fail(f"{path}: sha256 differs from shards/{shard}.json")
+        companion = data / f"{name}.gz"
+        if companion.exists():
+            verify_blob(companion, (sha1, sha256), compressed=True)
+            entries[name]["gzip"] = True
+        elif entries[name].get("gzip", False):
+            fail(f"{companion}: advertised gzip is missing; shards are append-only")
         if name in descriptions:
             entries[name]["description"] = descriptions[name]
     for sha1 in sorted(set(descriptions) - on_disk):
@@ -270,13 +328,27 @@ def scan(shard, checkout):
     build()
 
 
-if __name__ == "__main__":
-    if len(sys.argv) >= 5 and sys.argv[1] == "ingest":
-        ingest(sys.argv[2], sys.argv[3], sys.argv[4:])
-    elif len(sys.argv) == 4 and sys.argv[1] == "scan":
-        scan(sys.argv[2], sys.argv[3])
-    elif len(sys.argv) == 2 and sys.argv[1] in ("build", "check"):
-        globals()[sys.argv[1]]()
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    ingest_parser = commands.add_parser("ingest", help="store raw blobs and gzip companions, then scan")
+    ingest_parser.add_argument("--no-gzip", action="store_true", help="do not create gzip companions (existing copies are still verified)")
+    ingest_parser.add_argument("shard")
+    ingest_parser.add_argument("checkout")
+    ingest_parser.add_argument("files", nargs="+")
+    scan_parser = commands.add_parser("scan", help="verify blobs and gzip companions, then build")
+    scan_parser.add_argument("shard")
+    scan_parser.add_argument("checkout")
+    commands.add_parser("build", help="rebuild all index versions")
+    commands.add_parser("check", help="validate generated indexes")
+    args = parser.parse_args()
+    if args.command == "ingest":
+        ingest(args.shard, args.checkout, args.files, compress=not args.no_gzip)
+    elif args.command == "scan":
+        scan(args.shard, args.checkout)
     else:
-        print(f"usage: {sys.argv[0]} ingest <shard> <checkout> <file>... | scan <shard> <checkout> | build | check", file=sys.stderr)
-        sys.exit(1)
+        globals()[args.command]()
+
+
+if __name__ == "__main__":
+    main()

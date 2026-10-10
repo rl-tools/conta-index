@@ -13,6 +13,7 @@
     .controls > div { max-width: 100%; }
     #search-table { overflow-x: auto; margin-bottom: .75rem; }
     #search-table table { width: 100%; min-width: 48rem; table-layout: fixed; border-collapse: collapse; font-size: .9rem; }
+    #search-table .sha1-column { width: calc(40ch + 1rem); font: .85rem monospace; }
     #search-table th, #search-table td { padding: .35rem .5rem; text-align: left; vertical-align: top; border-bottom: 1px solid #ddd; overflow-wrap: anywhere; }
     #search-table th { padding: 0; background: #f5f5f5; }
     #search-table .sort-column { display: block; width: 100%; padding: .35rem .5rem; border: 0; background: none; color: inherit; text-align: left; cursor: pointer; }
@@ -54,6 +55,12 @@
     <button id="search-retry" type="button" hidden>Retry</button>
     <div id="search-table" role="region" aria-label="Search results" tabindex="0" hidden>
       <table>
+        <colgroup>
+          <col>
+          <col class="sha1-column">
+          <col>
+          <col>
+        </colgroup>
         <thead>
           <tr>
             <th scope="col"><button type="button" class="sort-column" data-sort="description">Description<span aria-hidden="true"></span></button></th>

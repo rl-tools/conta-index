@@ -91,13 +91,13 @@ class IngestionTests(unittest.TestCase):
             self.assertEqual(compressed[4:8], b"\x00" * 4)  # Fixed timestamp.
         self.assertEqual(len(list(self.data.iterdir())), 6)
         for entry in self.index()["entries"]:
-            self.assertEqual(entry["shards"], [{"id": "primary", "gzip": True}])
+            self.assertEqual(entry["shards"], [{"id": "primary", "compressed": ["gz"]}])
         self.run_cli("check")
 
     def test_opt_out_then_reingest_backfills_without_changing_description(self):
         self.ingest("--no-gzip")
         self.assertFalse(self.zipped.exists())
-        self.assertEqual(self.index()["entries"][0]["shards"], [{"id": "primary", "gzip": False}])
+        self.assertEqual(self.index()["entries"][0]["shards"], [{"id": "primary", "compressed": []}])
         metadata = (self.checkout / "metadata.json").read_bytes()
         raw_mtime = self.raw.stat().st_mtime_ns
         renamed = self.root / "renamed.bin"
@@ -119,7 +119,7 @@ class IngestionTests(unittest.TestCase):
         self.ingest()
         entry = self.index()["entries"][0]
         self.assertEqual(entry["shards"], [
-            {"id": "primary", "gzip": True}, {"id": "mirror", "gzip": False},
+            {"id": "primary", "compressed": ["gz"]}, {"id": "mirror", "compressed": []},
         ])
         self.assertEqual(entry["sha256"], hashlib.sha256(self.payload).hexdigest())
         self.run_cli("check")
@@ -137,7 +137,7 @@ class IngestionTests(unittest.TestCase):
         compressed = gzip.compress(self.payload, compresslevel=1, mtime=123)
         self.zipped.write_bytes(compressed)
         self.run_cli("scan", "primary", self.checkout)
-        self.assertTrue(self.index()["entries"][0]["shards"][0]["gzip"])
+        self.assertEqual(self.index()["entries"][0]["shards"][0]["compressed"], ["gz"])
         self.ingest()
         self.assertEqual(self.zipped.read_bytes(), compressed)
 
@@ -207,16 +207,68 @@ class IngestionTests(unittest.TestCase):
                 self.assert_scan_fails_without_publishing("git lfs pull")
                 path.write_bytes(original)
 
-    def test_non_boolean_source_flag_is_rejected(self):
+    def test_invalid_source_compressed_arrays_are_rejected(self):
         self.ingest()
         source = self.root / "shards" / "primary.json"
         entries = json.loads(source.read_bytes())
-        for flag in (1, "true", None, []):
-            with self.subTest(flag=flag):
-                entries[0]["gzip"] = flag
+        for compression in (True, "gz", None, {}, [""], ["gz", "gz"], ["gz", 1], [[]], [".gz"], ["../gz"], ["GZ"], ["gz?x"]):
+            with self.subTest(compression=compression):
+                entries[0]["compressed"] = compression
                 source.write_text(json.dumps(entries))
                 result = self.run_cli("check", success=False)
-                self.assertIn("gzip must be a boolean", result.stderr)
+                self.assertIn("compressed must be an array of unique lowercase alphanumeric extensions", result.stderr)
+
+    def test_algorithm_name_requires_the_extension_token(self):
+        self.ingest()
+        source = self.root / "shards" / "primary.json"
+        entries = json.loads(source.read_bytes())
+        entries[0]["compressed"] = ["gzip"]
+        source.write_text(json.dumps(entries))
+        result = self.run_cli("check", success=False)
+        self.assertIn("use gz instead of gzip in compressed", result.stderr)
+
+    def test_missing_source_compressed_means_raw_only(self):
+        self.ingest("--no-gzip")
+        source = self.root / "shards" / "primary.json"
+        entries = json.loads(source.read_bytes())
+        entries[0].pop("compressed")
+        source.write_text(json.dumps(entries))
+        self.run_cli("build")
+        self.assertEqual(self.index()["entries"][0]["shards"], [{"id": "primary", "compressed": []}])
+        self.run_cli("check")
+
+    def test_scan_preserves_future_compressions_when_adding_gzip(self):
+        self.ingest("--no-gzip")
+        source = self.root / "shards" / "primary.json"
+        entries = json.loads(source.read_bytes())
+        entries[0]["compressed"] = ["zst"]
+        source.write_text(json.dumps(entries))
+        self.run_cli("build")
+        self.assertEqual(self.index()["entries"][0]["shards"][0]["compressed"], ["zst"])
+        self.zipped.write_bytes(gzip.compress(self.payload))
+        self.run_cli("scan", "primary", self.checkout)
+        self.run_cli("scan", "primary", self.checkout)
+        self.assertEqual(json.loads(source.read_bytes())[0]["compressed"], ["zst", "gz"])
+        self.assertEqual(self.index()["entries"][0]["shards"][0]["compressed"], ["zst", "gz"])
+        self.run_cli("check")
+        self.zipped.unlink()
+        self.assert_scan_fails_without_publishing("advertised gzip is missing")
+
+    def test_legacy_compression_fields_are_not_silently_dropped(self):
+        self.ingest()
+        source = self.root / "shards" / "primary.json"
+        entries = json.loads(source.read_bytes())
+        entries[0].pop("compressed")
+        for field, value, message in (
+            ("gzip", True, "replace the gzip boolean with a compressed array"),
+            ("compression", ["gz"], "rename compression to compressed"),
+        ):
+            with self.subTest(field=field):
+                entries[0][field] = value
+                source.write_text(json.dumps(entries))
+                result = self.run_cli("check", success=False)
+                self.assertIn(message, result.stderr)
+                entries[0].pop(field)
 
     def test_interrupted_compression_never_publishes_partial_gzip(self):
         self.ingest("--no-gzip")

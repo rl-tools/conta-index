@@ -13,6 +13,7 @@
   const sortButtons = document.querySelectorAll(".sort-column");
   const naturalOrder = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
   const pageSize = 50;
+  const supportedCompressed = new Set(["gz"]);
   let indexPromise;
   let timer;
   let revision = 0;
@@ -51,13 +52,16 @@
     return indexPromise;
   }
 
-  function downloadURL(template, entry, compressed = false) {
+  function downloadURL(template, entry, extension = null) {
     if (typeof template !== "string") return null;
     try {
       const url = new URL(template
         .replaceAll("{sha1}", entry.sha1)
         .replaceAll("{sha256}", entry.sha256));
-      if (compressed) url.pathname += ".gz";
+      if (extension !== null) {
+        if (!supportedCompressed.has(extension)) return null;
+        url.pathname += `.${extension}`;
+      }
       return ["https:", "http:"].includes(url.protocol) ? url.href : null;
     } catch {
       return null;
@@ -129,13 +133,13 @@
       }
       const links = document.createElement("td");
       for (const location of entry.shards || []) {
-        for (const compressed of location.gzip === true ? [false, true] : [false]) {
-          const url = downloadURL(shards?.[location.id]?.url, entry, compressed);
+        for (const extension of [null, ...(location.compressed || [])]) {
+          const url = downloadURL(shards?.[location.id]?.url, entry, extension);
           if (!url) continue;
           const link = document.createElement("a");
           link.href = url;
-          link.textContent = compressed ? `${location.id} (.gz)` : location.id;
-          link.title = `Download ${compressed ? "gzip" : "raw"} from ${location.id}`;
+          link.textContent = extension ? `${location.id} (.${extension})` : location.id;
+          link.title = `Download ${extension ? `.${extension}` : "raw"} from ${location.id}`;
           links.append(link);
         }
       }

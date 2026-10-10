@@ -61,7 +61,7 @@ async function render(index) {
   return { rows: () => element("search-results").children, sort };
 }
 
-test("v1 location objects render raw and advertised gzip links with URL queries preserved", { timeout: 2000 }, async () => {
+test("compressed arrays render known formats, skip unknown names, and preserve URL queries", { timeout: 2000 }, async () => {
   const sha1 = "a".repeat(40);
   const sha256 = "b".repeat(64);
   const page = await render({
@@ -72,8 +72,8 @@ test("v1 location objects render raw and advertised gzip links with URL queries 
       invalid: { url: "javascript:alert('{sha1}')" },
     },
     entries: [{ sha1, sha256, description: "Example blob", shards: [
-      { id: "primary", gzip: true }, { id: "mirror", gzip: false },
-      { id: "legacy" }, { id: "invalid", gzip: true },
+      { id: "primary", compressed: ["future", "gzip", "gz"] }, { id: "mirror", compressed: ["future"] },
+      { id: "legacy" }, { id: "invalid", compressed: ["gz"] },
     ] }],
   });
   const links = page.rows()[0].children[3].children;
@@ -89,8 +89,8 @@ test("download sorting uses shard IDs from location objects", { timeout: 2000 },
   const page = await render({
     shards: { alpha: { url: "https://a.test/{sha1}" }, zulu: { url: "https://z.test/{sha1}" } },
     entries: [
-      { sha1: "a".repeat(40), sha256: "a".repeat(64), description: "Zulu blob", shards: [{ id: "zulu", gzip: false }] },
-      { sha1: "b".repeat(40), sha256: "b".repeat(64), description: "Alpha blob", shards: [{ id: "alpha", gzip: true }] },
+      { sha1: "a".repeat(40), sha256: "a".repeat(64), description: "Zulu blob", shards: [{ id: "zulu", compressed: [] }] },
+      { sha1: "b".repeat(40), sha256: "b".repeat(64), description: "Alpha blob", shards: [{ id: "alpha", compressed: ["gz"] }] },
     ],
   });
   page.sort.listeners.click();

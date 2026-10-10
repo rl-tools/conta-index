@@ -24,6 +24,7 @@ INDEX_LOCATION = "generated/index.json"
 VERSION_NAME = re.compile(r"^[1-9][0-9]*$")
 SHA1 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+COMPRESSED_EXTENSION = re.compile(r"^[a-z0-9]+$")
 LFS_POINTER = b"version https://git-lfs"
 
 
@@ -74,8 +75,17 @@ def load_shard(shard):
             fail(f"{path}: bad digests in {entry}")
         if sha1 in seen:
             fail(f"{path}: {sha1} is listed twice")
-        if type(entry.get("gzip", False)) is not bool:
-            fail(f"{path}: gzip must be a boolean for {sha1}")
+        if "gzip" in entry:
+            fail(f"{path}: replace the gzip boolean with a compressed array for {sha1}")
+        if "compression" in entry:
+            fail(f"{path}: rename compression to compressed for {sha1}")
+        compressed = entry.get("compressed", [])
+        if (not isinstance(compressed, list)
+                or any(not isinstance(extension, str) or not COMPRESSED_EXTENSION.fullmatch(extension) for extension in compressed)
+                or len(set(compressed)) != len(compressed)):
+            fail(f"{path}: compressed must be an array of unique lowercase alphanumeric extensions for {sha1}")
+        if "gzip" in compressed:
+            fail(f"{path}: use gz instead of gzip in compressed for {sha1}")
         seen.add(sha1)
     return entries
 
@@ -95,7 +105,7 @@ def combine(shards):
     combined = {}
     for shard in shards:
         for entry in load_shard(shard):
-            location = {"id": shard, "gzip": entry.get("gzip", False)}
+            location = {"id": shard, "compressed": entry.get("compressed", [])}
             existing = combined.get(entry["sha1"])
             if existing is None:
                 combined[entry["sha1"]] = {"sha1": entry["sha1"], "sha256": entry["sha256"], "shards": [location], "description": entry.get("description", "")}
@@ -311,11 +321,13 @@ def scan(shard, checkout):
             entries[name] = {"sha1": sha1, "sha256": sha256, "description": ""}
         elif entries[name]["sha256"] != sha256:
             fail(f"{path}: sha256 differs from shards/{shard}.json")
+        compressed = entries[name].setdefault("compressed", [])
         companion = data / f"{name}.gz"
         if companion.exists():
             verify_blob(companion, (sha1, sha256), compressed=True)
-            entries[name]["gzip"] = True
-        elif entries[name].get("gzip", False):
+            if "gz" not in compressed:
+                compressed.append("gz")
+        elif "gz" in compressed:
             fail(f"{companion}: advertised gzip is missing; shards are append-only")
         if name in descriptions:
             entries[name]["description"] = descriptions[name]

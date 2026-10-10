@@ -341,16 +341,33 @@ def scan(shard, checkout):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Arguments in <angle brackets> are placeholders; replace them with your values.\n\n"
+               "Example scan:\n  python3 tools/conta_index.py scan procthor ../conta-shards/procthor/",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
-    ingest_parser = commands.add_parser("ingest", help="store raw blobs and gzip companions, then scan")
+    ingest_parser = commands.add_parser(
+        "ingest", help="store raw blobs and gzip companions, then scan",
+        description="Store files in the shard checkout, update its metadata, then scan and rebuild the index.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Arguments in <angle brackets> are placeholders; replace them with your values.\n\n"
+               "Example:\n  python3 tools/conta_index.py ingest procthor ../conta-shards/procthor/ house.glb",
+    )
     ingest_parser.add_argument("--no-gzip", action="store_true", help="do not create gzip companions (existing copies are still verified)")
-    ingest_parser.add_argument("shard")
-    ingest_parser.add_argument("checkout")
-    ingest_parser.add_argument("files", nargs="+")
-    scan_parser = commands.add_parser("scan", help="verify blobs and gzip companions, then build")
-    scan_parser.add_argument("shard")
-    scan_parser.add_argument("checkout")
+    ingest_parser.add_argument("shard", metavar="<shard>", help="registered shard ID from version/<n>/shards.json (e.g. procthor)")
+    ingest_parser.add_argument("checkout", metavar="<checkout>", help="path to the local shard checkout (e.g. ../conta-shards/procthor/)")
+    ingest_parser.add_argument("files", metavar="<file>", nargs="+", help="one or more source files to ingest")
+    scan_parser = commands.add_parser(
+        "scan", help="verify blobs and gzip companions, then build",
+        description="Verify the checkout's raw blobs and gzip companions, update shards/<shard>.json, and rebuild the index.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Arguments in <angle brackets> are placeholders; replace them with your values.\n\n"
+               "Example:\n  python3 tools/conta_index.py scan procthor ../conta-shards/procthor/",
+    )
+    scan_parser.add_argument("shard", metavar="<shard>", help="registered shard ID from version/<n>/shards.json (e.g. procthor)")
+    scan_parser.add_argument("checkout", metavar="<checkout>", help="path to the local shard checkout containing data/ (e.g. ../conta-shards/procthor/)")
     commands.add_parser("build", help="rebuild all index versions")
     commands.add_parser("check", help="validate generated indexes")
     args = parser.parse_args()

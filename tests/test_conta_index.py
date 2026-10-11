@@ -1,4 +1,5 @@
 import contextlib
+from datetime import datetime, timezone
 import gzip
 import hashlib
 import importlib.util
@@ -73,6 +74,152 @@ class IngestionTests(unittest.TestCase):
         before = self.snapshot()
         result = self.run_cli("scan", "primary", self.checkout, success=False)
         self.assertIn(message, result.stderr)
+        self.assertEqual(before, self.snapshot())
+
+    def set_timestamp(self, shard, timestamp):
+        path = self.root / "shards" / f"{shard}.json"
+        entries = json.loads(path.read_bytes())
+        for entry in entries:
+            entry.pop("first_indexed_at", None)
+            if timestamp is not None:
+                entry["first_indexed_at"] = timestamp
+        path.write_text(json.dumps(entries))
+
+    def test_ingest_and_scan_timestamp_new_entries_in_utc(self):
+        before = datetime.now(timezone.utc).replace(microsecond=0)
+        self.ingest()
+        mirror = self.root / "mirror-checkout"
+        (mirror / "data").mkdir(parents=True)
+        (mirror / "data" / self.sha1).write_bytes(self.payload)
+        self.run_cli("scan", "mirror", mirror)
+        after = datetime.now(timezone.utc).replace(microsecond=0)
+        timestamps = []
+        for shard in ("primary", "mirror"):
+            entry = json.loads((self.root / "shards" / f"{shard}.json").read_bytes())[0]
+            timestamp = entry["first_indexed_at"]
+            self.assertRegex(timestamp, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+            instant = datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            self.assertLessEqual(before, instant)
+            self.assertLessEqual(instant, after)
+            timestamps.append(timestamp)
+        entry = self.index()["entries"][0]
+        self.assertEqual(entry["first_indexed_at"], min(timestamps))
+        self.run_cli("check")
+
+    def test_scans_metadata_updates_and_gzip_preserve_known_and_unknown_dates(self):
+        self.ingest("--no-gzip")
+        path = self.root / "shards" / "primary.json"
+        for timestamp in ("2020-02-29T12:34:56Z", None):
+            with self.subTest(timestamp=timestamp):
+                if self.zipped.exists():
+                    self.zipped.unlink()
+                entries = json.loads(path.read_bytes())
+                entries[0]["compressed"] = []
+                path.write_text(json.dumps(entries))
+                self.set_timestamp("primary", timestamp)
+                self.run_cli("build")
+                self.run_cli("scan", "primary", self.checkout)
+                description = f"updated metadata with date {timestamp}"
+                (self.checkout / "metadata.json").write_text(json.dumps([
+                    {"hash": self.sha1, "description": description},
+                ]))
+                self.run_cli("scan", "primary", self.checkout)
+                self.ingest()
+                self.ingest()
+                entry = json.loads(path.read_bytes())[0]
+                self.assertEqual(entry["description"], description)
+                self.assertEqual(entry["compressed"], ["gz"])
+                generated = self.index()["entries"][0]
+                if timestamp is None:
+                    self.assertNotIn("first_indexed_at", entry)
+                    self.assertNotIn("first_indexed_at", generated)
+                else:
+                    self.assertEqual(entry["first_indexed_at"], timestamp)
+                    self.assertEqual(generated["first_indexed_at"], timestamp)
+                self.run_cli("check")
+
+    def test_first_indexed_date_uses_all_shared_shards_and_not_preference_order(self):
+        self.ingest()
+        self.run_cli("ingest", "mirror", self.root / "mirror-checkout", self.input)
+        self.set_timestamp("primary", "2024-01-01T00:00:00Z")
+        self.set_timestamp("mirror", "2020-01-01T00:00:00Z")
+        self.run_cli("build")
+        self.assertEqual(self.index()["entries"][0]["first_indexed_at"], "2020-01-01T00:00:00Z")
+        archive = self.root / "shards" / "archive.json"
+        shutil.copyfile(self.root / "shards" / "mirror.json", archive)
+        self.set_timestamp("archive", "2018-01-01T00:00:00Z")
+        table_path = self.version / "shards.json"
+        table = json.loads(table_path.read_bytes())
+        for order in (("primary", "mirror"), ("mirror", "primary"), ("primary",)):
+            with self.subTest(order=order):
+                table_path.write_text(json.dumps({shard: table[shard] for shard in order}))
+                self.run_cli("build")
+                entry = self.index()["entries"][0]
+                self.assertEqual([location["id"] for location in entry["shards"]], list(order))
+                self.assertEqual(entry["first_indexed_at"], "2018-01-01T00:00:00Z")
+                self.run_cli("check")
+        self.set_timestamp("primary", "2017-01-01T00:00:00Z")
+        self.run_cli("build")
+        entry = self.index()["entries"][0]
+        self.assertEqual(entry["first_indexed_at"], "2017-01-01T00:00:00Z")
+
+    def test_unknown_copy_prevents_a_false_first_indexed_date(self):
+        self.ingest()
+        self.run_cli("ingest", "mirror", self.root / "mirror-checkout", self.input)
+        table_path = self.version / "shards.json"
+        table = json.loads(table_path.read_bytes())
+        for unknown_shard in ("primary", "mirror"):
+            for visible_shards in (("primary", "mirror"), ("primary",)):
+                with self.subTest(unknown_shard=unknown_shard, visible_shards=visible_shards):
+                    table_path.write_text(json.dumps({shard: table[shard] for shard in visible_shards}))
+                    for shard in ("primary", "mirror"):
+                        self.set_timestamp(shard, "2020-01-01T00:00:00Z")
+                    self.set_timestamp(unknown_shard, None)
+                    self.run_cli("build")
+                    entry = self.index()["entries"][0]
+                    self.assertNotIn("first_indexed_at", entry)
+                    self.run_cli("check")
+
+    def test_invalid_timestamp_values_are_rejected(self):
+        self.ingest()
+        path = self.root / "shards" / "primary.json"
+        original = json.loads(path.read_bytes())
+        invalid_timestamps = (
+            None, True, 123, [], {}, "", "2020-01-01", "2020-01-01T00:00:00+00:00",
+            "2020-01-01T00:00:00.000Z", "2020-01-01T00:00:00z", "2020-1-01T00:00:00Z",
+            "2020-01-01T00:00:00Z\n", "2021-02-29T00:00:00Z", "2020-13-01T00:00:00Z",
+            "2020-01-01T24:00:00Z", "2020-01-01T00:00:60Z",
+        )
+        for timestamp in invalid_timestamps:
+            with self.subTest(timestamp=timestamp):
+                original[0]["first_indexed_at"] = timestamp
+                path.write_text(json.dumps(original))
+                result = self.run_cli("check", success=False)
+                self.assertIn("first_indexed_at", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
+    def test_failed_scan_does_not_publish_new_entry_or_timestamp(self):
+        self.data.mkdir(parents=True)
+        self.raw.write_bytes(self.payload)
+        self.zipped.write_bytes(b"corrupt")
+        result = self.run_cli("scan", "primary", self.checkout, success=False)
+        self.assertIn("not a gzip file", result.stderr)
+        self.assertFalse((self.root / "shards" / "primary.json").exists())
+        self.assertFalse((self.version / "generated" / "index.json").exists())
+
+    def test_build_and_check_preserve_stored_timestamps_without_reading_clock(self):
+        self.ingest()
+        self.set_timestamp("primary", "2020-02-29T12:34:56Z")
+        self.run_cli("build")
+        before = self.snapshot()
+        with mock.patch.multiple(INDEX, ROOT=self.root, SHARDS=self.root / "shards",
+                                 VERSIONS=self.root / "version", CURRENT=self.root / "current.json"):
+            with mock.patch.object(INDEX, "datetime", wraps=datetime) as clock:
+                clock.now.side_effect = AssertionError("build/check must not read the clock")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    INDEX.build()
+                    INDEX.check()
+                    INDEX.build()
         self.assertEqual(before, self.snapshot())
 
     def test_default_ingestion_round_trips_empty_binary_and_large_files(self):

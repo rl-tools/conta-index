@@ -10,6 +10,10 @@ Which shard holds each conta blob. Consumers never read this repository directly
 
 A shard stores raw blobs named by their SHA-1, optionally accompanied by `<sha1>.gz`. Both digests always identify the original, uncompressed bytes. Never delete or rewrite a raw blob or an advertised compressed companion; the index is append-only, so a newer index never has fewer entries or advertised copies. For raw and gzip copies, `scan` rejects corrupt files, orphan gzip companions, and missing previously indexed copies.
 
+Shard entries may also have `first_indexed_at`, the UTC time when that blob was first registered through that shard in this index repository, in `YYYY-MM-DDTHH:MM:SSZ` format (for example, `2026-10-10T18:42:00Z`). `scan` and `ingest` set it once for new shard entries. Rescanning, changing descriptions, and adding compressed copies preserve existing timestamps; older entries without a known date stay undated. This records registration here, not when the blob was produced or published.
+
+Generated entries use the same `first_indexed_at` field for the earliest date across all copies of the blob in the shared `shards/*.json` sources, including shards outside that version's shard table. If any copy has an unknown date, `first_indexed_at` is omitted. `build` and `check` only read and aggregate stored dates; neither assigns the current time. Existing entries were backfilled from Git history using the committer timestamp of the first commit introducing each shard entry; these dates do not identify the originating RLtools commit.
+
 To ingest files into a new shard `<name>`, add `<name>` to `version/1/shards.json` with the url template under which `<checkout>/data` will be hosted, then run from the repository root:
 
 ```

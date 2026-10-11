@@ -5,6 +5,7 @@ build: for every version/<n>/, combine its shards.json with the shared shards/*.
 check: validate everything and fail if any generated file is stale, hand-edited or re-encoded."""
 
 import argparse
+from datetime import datetime, timezone
 import gzip
 import hashlib
 import json
@@ -25,6 +26,7 @@ VERSION_NAME = re.compile(r"^[1-9][0-9]*$")
 SHA1 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 COMPRESSED_EXTENSION = re.compile(r"^[a-z0-9]+$")
+FIRST_INDEXED_AT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 LFS_POINTER = b"version https://git-lfs"
 
 
@@ -86,6 +88,14 @@ def load_shard(shard):
             fail(f"{path}: compressed must be an array of unique lowercase alphanumeric extensions for {sha1}")
         if "gzip" in compressed:
             fail(f"{path}: use gz instead of gzip in compressed for {sha1}")
+        if "first_indexed_at" in entry:
+            timestamp = entry["first_indexed_at"]
+            if not isinstance(timestamp, str) or not FIRST_INDEXED_AT.fullmatch(timestamp):
+                fail(f"{path}: first_indexed_at must be a UTC timestamp YYYY-MM-DDTHH:MM:SSZ for {sha1}")
+            try:
+                datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
+            except ValueError:
+                fail(f"{path}: first_indexed_at is not a valid date and time for {sha1}")
         seen.add(sha1)
     return entries
 
@@ -101,10 +111,35 @@ def save_shard(shard, entries):
     (SHARDS / f"{shard}.json").write_bytes((lines_json(entries) + "\n").encode("utf-8"))
 
 
+def first_indexed_dates(sources):
+    """Derive blob dates globally, without allowing a dated mirror to hide unknown history."""
+    identities = {}
+    earliest = {}
+    unknown = set()
+    for shard, entries in sources.items():
+        for entry in entries:
+            sha1 = entry["sha1"]
+            sha256, previous_shard = identities.setdefault(sha1, (entry["sha256"], shard))
+            if entry["sha256"] != sha256:
+                fail(f"{sha1}: sha256 differs between shards {previous_shard} and {shard}")
+            if "first_indexed_at" not in entry:
+                unknown.add(sha1)
+                continue
+            # Canonical UTC timestamps sort chronologically.
+            timestamp = entry["first_indexed_at"]
+            if sha1 not in earliest or timestamp < earliest[sha1]:
+                earliest[sha1] = timestamp
+    return {sha1: timestamp for sha1, timestamp in earliest.items() if sha1 not in unknown}
+
+
 def combine(shards):
+    # A version's download locations may omit the shard that first indexed a
+    # blob. Its historical metadata still comes from all shared shard sources.
+    sources = {path.stem: load_shard(path.stem) for path in sorted(SHARDS.glob("*.json"))}
+    dates = first_indexed_dates(sources)
     combined = {}
     for shard in shards:
-        for entry in load_shard(shard):
+        for entry in sources.get(shard, []):
             location = {"id": shard, "compressed": entry.get("compressed", [])}
             existing = combined.get(entry["sha1"])
             if existing is None:
@@ -118,6 +153,8 @@ def combine(shards):
                 existing["description"] = existing["description"] or entry.get("description", "")
     entries = [combined[sha1] for sha1 in sorted(combined)]
     for entry in entries:
+        if entry["sha1"] in dates:
+            entry["first_indexed_at"] = dates[entry["sha1"]]
         if not entry["description"]:
             warn(f"{entry['sha1']}: no description")
     table = ",\n".join(f"{json.dumps(shard)}: {json.dumps(spec, ensure_ascii=False)}" for shard, spec in shards.items())
@@ -303,6 +340,7 @@ def scan(shard, checkout):
         fail(f"{data} is not a directory")
     descriptions = descriptions_from_metadata(checkout)
     entries = {entry["sha1"]: entry for entry in load_shard(shard)}
+    additions = []
     on_disk = set()
     for path in sorted(data.iterdir()):
         name = path.name
@@ -319,6 +357,7 @@ def scan(shard, checkout):
             fail(f"{path}: content hashes to {sha1}")
         if name not in entries:
             entries[name] = {"sha1": sha1, "sha256": sha256, "description": ""}
+            additions.append(entries[name])
         elif entries[name]["sha256"] != sha256:
             fail(f"{path}: sha256 differs from shards/{shard}.json")
         compressed = entries[name].setdefault("compressed", [])
@@ -335,6 +374,10 @@ def scan(shard, checkout):
         warn(f"metadata.json lists {sha1} ({descriptions[sha1]}) but {data / sha1} does not exist")
     for sha1 in sorted(set(entries) - on_disk):
         fail(f"{sha1} is in shards/{shard}.json but missing from {data}: shards are append-only")
+    if additions:
+        timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+        for entry in additions:
+            entry["first_indexed_at"] = timestamp
     save_shard(shard, list(entries.values()))
     print(f"{SHARDS / f'{shard}.json'}: {len(entries)} entries")
     build()

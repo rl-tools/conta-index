@@ -41,6 +41,7 @@
             sha1: entry.sha1.toLowerCase(),
             sha256: entry.sha256.toLowerCase(),
             downloads: (entry.shards || []).map(location => location.id).join(" ").toLowerCase(),
+            first_indexed_at: entry.first_indexed_at || "",
           })),
         }))
         .catch(error => {
@@ -84,8 +85,8 @@
   function sortAndRender() {
     const compare = (a, b) => a < b ? -1 : a > b ? 1 : 0;
     matches.sort((a, b) => {
-      // Digests use lexical order; descriptions and shard names use natural order.
-      const order = sortColumn === "sha1" || sortColumn === "sha256"
+      // Digests and UTC timestamps use lexical order; descriptions and shard names use natural order.
+      const order = sortColumn === "sha1" || sortColumn === "sha256" || sortColumn === "first_indexed_at"
         ? compare(a[sortColumn], b[sortColumn])
         : naturalOrder.compare(a[sortColumn], b[sortColumn]);
       return (order || compare(a.sha1, b.sha1)) * sortDirection;
@@ -144,6 +145,17 @@
         }
       }
       item.append(links);
+      const firstIndexed = document.createElement("td");
+      if (entry.first_indexed_at) {
+        const time = document.createElement("time");
+        time.dateTime = entry.first_indexed_at;
+        time.title = entry.first_indexed_at;
+        time.textContent = entry.first_indexed_at.slice(0, 10);
+        firstIndexed.append(time);
+      } else {
+        firstIndexed.textContent = "Unknown";
+      }
+      item.append(firstIndexed);
       fragment.append(item);
     }
     results.append(fragment);

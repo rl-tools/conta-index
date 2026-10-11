@@ -12,8 +12,9 @@
     .controls label { display: block; margin-bottom: .25rem; }
     .controls > div { max-width: 100%; }
     #search-table { overflow-x: auto; margin-bottom: .75rem; }
-    #search-table table { width: 100%; min-width: 48rem; table-layout: fixed; border-collapse: collapse; font-size: .9rem; }
+    #search-table table { width: 100%; min-width: 58rem; table-layout: fixed; border-collapse: collapse; font-size: .9rem; }
     #search-table .sha1-column { width: calc(40ch + 1rem); font: .85rem monospace; }
+    #search-table .first-indexed-column { width: 10rem; }
     #search-table th, #search-table td { padding: .35rem .5rem; text-align: left; vertical-align: top; border-bottom: 1px solid #ddd; overflow-wrap: anywhere; }
     #search-table th { padding: 0; background: #f5f5f5; }
     #search-table .sort-column { display: block; width: 100%; padding: .35rem .5rem; border: 0; background: none; color: inherit; text-align: left; cursor: pointer; }
@@ -60,6 +61,7 @@
           <col class="sha1-column">
           <col>
           <col>
+          <col class="first-indexed-column">
         </colgroup>
         <thead>
           <tr>
@@ -67,6 +69,7 @@
             <th scope="col"><button type="button" class="sort-column" data-sort="sha1">SHA-1<span aria-hidden="true"></span></button></th>
             <th scope="col"><button type="button" class="sort-column" data-sort="sha256">SHA-256<span aria-hidden="true"></span></button></th>
             <th scope="col"><button type="button" class="sort-column" data-sort="downloads">Downloads<span aria-hidden="true"></span></button></th>
+            <th scope="col"><button type="button" class="sort-column" data-sort="first_indexed_at">First indexed at<span aria-hidden="true"></span></button></th>
           </tr>
         </thead>
         <tbody id="search-results"></tbody>

@@ -5,15 +5,16 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>conta-index</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 70rem; margin: 2rem auto; padding: 0 1rem; }
+    body { font-family: system-ui, sans-serif; max-width: 78rem; margin: 2rem auto; padding: 0 1rem; }
     input, select, button { font: inherit; padding: .35rem; }
     input { width: 28rem; max-width: 100%; box-sizing: border-box; }
     .controls { display: flex; flex-wrap: wrap; align-items: end; gap: .75rem; }
     .controls label { display: block; margin-bottom: .25rem; }
     .controls > div { max-width: 100%; }
     #search-table { overflow-x: auto; margin-bottom: .75rem; }
-    #search-table table { width: 100%; min-width: 58rem; table-layout: fixed; border-collapse: collapse; font-size: .9rem; }
+    #search-table table { width: 100%; min-width: 66rem; table-layout: fixed; border-collapse: collapse; font-size: .9rem; }
     #search-table .sha1-column { width: calc(40ch + 1rem); font: .85rem monospace; }
+    #search-table .size-column { width: 8rem; }
     #search-table .first-indexed-column { width: 10rem; }
     #search-table th, #search-table td { padding: .35rem .5rem; text-align: left; vertical-align: top; border-bottom: 1px solid #ddd; overflow-wrap: anywhere; }
     #search-table th { padding: 0; background: #f5f5f5; }
@@ -25,6 +26,7 @@
     #search-results .hash-copy:focus-visible { outline: 2px solid #06c; outline-offset: 2px; }
     #search-results code { display: block; font-size: .85rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     #search-results a { display: inline-block; margin-right: .5rem; }
+    #search-results .file-size { white-space: nowrap; }
     .visually-hidden { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
   </style>
   <script src="search.js" defer></script>
@@ -49,7 +51,7 @@
         </div>
         <button type="submit">Search</button>
       </div>
-      <p id="search-help">Matches all space-separated terms, ignoring case. Hash fragments work too.</p>
+      <p id="search-help">Matches all space-separated terms, ignoring case. Hash fragments work too. File size shows the uncompressed size.</p>
     </form>
     <p id="search-status" role="status">Enter a description or hash to search.</p>
     <span id="copy-status" class="visually-hidden" role="status"></span>
@@ -60,6 +62,7 @@
           <col>
           <col class="sha1-column">
           <col>
+          <col class="size-column">
           <col>
           <col class="first-indexed-column">
         </colgroup>
@@ -68,6 +71,7 @@
             <th scope="col"><button type="button" class="sort-column" data-sort="description">Description<span aria-hidden="true"></span></button></th>
             <th scope="col"><button type="button" class="sort-column" data-sort="sha1">SHA-1<span aria-hidden="true"></span></button></th>
             <th scope="col"><button type="button" class="sort-column" data-sort="sha256">SHA-256<span aria-hidden="true"></span></button></th>
+            <th scope="col"><button type="button" class="sort-column" data-sort="size">File size<span aria-hidden="true"></span></button></th>
             <th scope="col"><button type="button" class="sort-column" data-sort="downloads">Downloads<span aria-hidden="true"></span></button></th>
             <th scope="col"><button type="button" class="sort-column" data-sort="first_indexed_at">First indexed at<span aria-hidden="true"></span></button></th>
           </tr>

@@ -114,7 +114,7 @@ class IngestionTests(unittest.TestCase):
                 if self.zipped.exists():
                     self.zipped.unlink()
                 entries = json.loads(path.read_bytes())
-                entries[0]["compressed"] = []
+                entries[0]["size"] = {"raw": len(self.payload)}
                 path.write_text(json.dumps(entries))
                 self.set_timestamp("primary", timestamp)
                 self.run_cli("build")
@@ -128,7 +128,9 @@ class IngestionTests(unittest.TestCase):
                 self.ingest()
                 entry = json.loads(path.read_bytes())[0]
                 self.assertEqual(entry["description"], description)
-                self.assertEqual(entry["compressed"], ["gz"])
+                self.assertEqual(entry["size"], {
+                    "raw": len(self.payload), "gz": self.zipped.stat().st_size,
+                })
                 generated = self.index()["entries"][0]
                 if timestamp is None:
                     self.assertNotIn("first_indexed_at", entry)
@@ -237,14 +239,25 @@ class IngestionTests(unittest.TestCase):
             self.assertEqual(compressed[3] & 8, 0)  # No original filename.
             self.assertEqual(compressed[4:8], b"\x00" * 4)  # Fixed timestamp.
         self.assertEqual(len(list(self.data.iterdir())), 6)
+        sources = {entry["sha1"]: entry for entry in json.loads(
+            (self.root / "shards" / "primary.json").read_bytes()
+        )}
         for entry in self.index()["entries"]:
-            self.assertEqual(entry["shards"], [{"id": "primary", "compressed": ["gz"]}])
+            sizes = {
+                "raw": (self.data / entry["sha1"]).stat().st_size,
+                "gz": (self.data / f"{entry['sha1']}.gz").stat().st_size,
+            }
+            self.assertEqual(entry["shards"], [{"id": "primary", "size": sizes}])
+            self.assertEqual(sources[entry["sha1"]]["size"], sizes)
+            self.assertNotIn("compressed", sources[entry["sha1"]])
         self.run_cli("check")
 
     def test_opt_out_then_reingest_backfills_without_changing_description(self):
         self.ingest("--no-gzip")
         self.assertFalse(self.zipped.exists())
-        self.assertEqual(self.index()["entries"][0]["shards"], [{"id": "primary", "compressed": []}])
+        self.assertEqual(self.index()["entries"][0]["shards"], [
+            {"id": "primary", "size": {"raw": len(self.payload)}},
+        ])
         metadata = (self.checkout / "metadata.json").read_bytes()
         raw_mtime = self.raw.stat().st_mtime_ns
         renamed = self.root / "renamed.bin"
@@ -266,7 +279,8 @@ class IngestionTests(unittest.TestCase):
         self.ingest()
         entry = self.index()["entries"][0]
         self.assertEqual(entry["shards"], [
-            {"id": "primary", "compressed": ["gz"]}, {"id": "mirror", "compressed": []},
+            {"id": "primary", "size": {"raw": len(self.payload), "gz": self.zipped.stat().st_size}},
+            {"id": "mirror", "size": {"raw": len(self.payload)}},
         ])
         self.assertEqual(entry["sha256"], hashlib.sha256(self.payload).hexdigest())
         self.run_cli("check")
@@ -279,14 +293,91 @@ class IngestionTests(unittest.TestCase):
         self.run_cli("ingest", "mirror", mirror, renamed)
         self.assertEqual(self.zipped.read_bytes(), (mirror / "data" / self.zipped.name).read_bytes())
 
+    def test_each_shard_retains_its_own_gzip_size(self):
+        self.ingest()
+        mirror = self.root / "mirror-checkout"
+        mirror_data = mirror / "data"
+        mirror_data.mkdir(parents=True)
+        (mirror_data / self.sha1).write_bytes(self.payload)
+        mirror_gzip = gzip.compress(self.payload, compresslevel=1, mtime=123)
+        self.assertNotEqual(len(mirror_gzip), self.zipped.stat().st_size)
+        (mirror_data / self.zipped.name).write_bytes(mirror_gzip)
+        self.run_cli("scan", "mirror", mirror)
+        self.assertEqual(self.index()["entries"][0]["shards"], [
+            {"id": "primary", "size": {"raw": len(self.payload), "gz": self.zipped.stat().st_size}},
+            {"id": "mirror", "size": {"raw": len(self.payload), "gz": len(mirror_gzip)}},
+        ])
+        self.run_cli("check")
+
+    def test_conflicting_raw_sizes_are_rejected_even_for_shards_outside_the_version(self):
+        self.ingest()
+        archive = self.root / "shards" / "archive.json"
+        entries = json.loads((self.root / "shards" / "primary.json").read_bytes())
+        entries[0]["size"]["raw"] += 1
+        archive.write_text(json.dumps(entries))
+        table_path = self.version / "shards.json"
+        table = json.loads(table_path.read_bytes())
+        table["archive"] = {"type": "http", "url": "https://example.test/archive/{sha1}"}
+        for include_archive in (False, True):
+            with self.subTest(include_archive=include_archive):
+                table_path.write_text(json.dumps({
+                    shard: spec for shard, spec in table.items()
+                    if shard != "archive" or include_archive
+                }))
+                before = self.snapshot()
+                for command in ("build", "check"):
+                    result = self.run_cli(command, success=False)
+                    self.assertIn("raw size", result.stderr)
+                    self.assertIn("primary", result.stderr)
+                    self.assertIn("archive", result.stderr)
+                    self.assertEqual(before, self.snapshot())
+                self.assert_scan_fails_without_publishing("raw size")
+
+    def test_build_and_check_use_stored_sizes_without_the_checkout(self):
+        self.ingest()
+        before = self.snapshot()
+        shutil.rmtree(self.checkout)
+        self.run_cli("build")
+        self.run_cli("check")
+        self.assertEqual(before, self.snapshot())
+
     def test_scan_discovers_existing_gzip_and_ingestion_preserves_it(self):
         self.ingest("--no-gzip")
         compressed = gzip.compress(self.payload, compresslevel=1, mtime=123)
         self.zipped.write_bytes(compressed)
         self.run_cli("scan", "primary", self.checkout)
-        self.assertEqual(self.index()["entries"][0]["shards"][0]["compressed"], ["gz"])
+        self.assertEqual(self.index()["entries"][0]["shards"][0]["size"], {
+            "raw": len(self.payload), "gz": len(compressed),
+        })
         self.ingest()
         self.assertEqual(self.zipped.read_bytes(), compressed)
+
+    def test_scan_rejects_incorrect_stored_sizes_without_publishing(self):
+        self.ingest()
+        source = self.root / "shards" / "primary.json"
+        original = source.read_bytes()
+        for representation in ("raw", "gz"):
+            with self.subTest(representation=representation):
+                entries = json.loads(original)
+                entries[0]["size"][representation] += 1
+                source.write_text(json.dumps(entries))
+                self.assert_scan_fails_without_publishing("size")
+
+    def test_scan_rejects_a_valid_recompressed_blob_with_a_changed_size(self):
+        self.ingest()
+        recompressed = gzip.compress(self.payload, compresslevel=1, mtime=123)
+        self.assertNotEqual(len(recompressed), self.zipped.stat().st_size)
+        self.zipped.write_bytes(recompressed)
+        self.assert_scan_fails_without_publishing("size")
+
+    def test_failed_scan_does_not_publish_discovered_sizes_or_new_entries(self):
+        self.ingest("--no-gzip")
+        self.zipped.write_bytes(gzip.compress(self.payload))
+        added = b"new blob discovered before scan fails"
+        added_sha1 = hashlib.sha1(added).hexdigest()
+        (self.data / added_sha1).write_bytes(added)
+        (self.data / f"{added_sha1}.gz").write_bytes(b"corrupt")
+        self.assert_scan_fails_without_publishing("not a gzip file")
 
     def test_scan_rejects_corrupt_or_mismatched_gzip_without_publishing(self):
         self.ingest()
@@ -354,49 +445,69 @@ class IngestionTests(unittest.TestCase):
                 self.assert_scan_fails_without_publishing("git lfs pull")
                 path.write_bytes(original)
 
-    def test_invalid_source_compressed_arrays_are_rejected(self):
+    def test_invalid_source_size_maps_are_rejected(self):
         self.ingest()
         source = self.root / "shards" / "primary.json"
         entries = json.loads(source.read_bytes())
-        for compression in (True, "gz", None, {}, [""], ["gz", "gz"], ["gz", 1], [[]], [".gz"], ["../gz"], ["GZ"], ["gz?x"]):
-            with self.subTest(compression=compression):
-                entries[0]["compressed"] = compression
+        invalid_sizes = (
+            True, 123, "gz", None, [], {}, {"gz": 1},
+            {"raw": -1}, {"raw": True}, {"raw": False}, {"raw": 1.5},
+            {"raw": "123"}, {"raw": None}, {"raw": []}, {"raw": {}},
+            {"raw": len(self.payload), "gz": -1},
+            {"raw": len(self.payload), "gz": True},
+            {"raw": len(self.payload), "gz": 1.5},
+            {"raw": len(self.payload), "gz": "123"},
+            {"raw": len(self.payload), "gz": None},
+            *({"raw": len(self.payload), extension: 123} for extension in (
+                "", ".gz", "../gz", "GZ", "gz?x", "gz\n", "raw.gz", "with-dash",
+            )),
+        )
+        for size in invalid_sizes:
+            with self.subTest(size=size):
+                entries[0]["size"] = size
                 source.write_text(json.dumps(entries))
                 result = self.run_cli("check", success=False)
-                self.assertIn("compressed must be an array of unique lowercase alphanumeric extensions", result.stderr)
+                self.assertIn("size", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
 
     def test_algorithm_name_requires_the_extension_token(self):
         self.ingest()
         source = self.root / "shards" / "primary.json"
         entries = json.loads(source.read_bytes())
-        entries[0]["compressed"] = ["gzip"]
+        entries[0]["size"]["gzip"] = entries[0]["size"].pop("gz")
         source.write_text(json.dumps(entries))
         result = self.run_cli("check", success=False)
-        self.assertIn("use gz instead of gzip in compressed", result.stderr)
+        self.assertIn("use gz instead of gzip", result.stderr)
 
-    def test_missing_source_compressed_means_raw_only(self):
+    def test_missing_source_size_is_rejected(self):
         self.ingest("--no-gzip")
         source = self.root / "shards" / "primary.json"
         entries = json.loads(source.read_bytes())
-        entries[0].pop("compressed")
+        entries[0].pop("size")
         source.write_text(json.dumps(entries))
-        self.run_cli("build")
-        self.assertEqual(self.index()["entries"][0]["shards"], [{"id": "primary", "compressed": []}])
-        self.run_cli("check")
+        result = self.run_cli("check", success=False)
+        self.assertIn("size", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
-    def test_scan_preserves_future_compressions_when_adding_gzip(self):
+    def test_scan_preserves_future_compression_sizes_when_adding_gzip(self):
         self.ingest("--no-gzip")
         source = self.root / "shards" / "primary.json"
         entries = json.loads(source.read_bytes())
-        entries[0]["compressed"] = ["zst"]
+        entries[0]["size"]["zst"] = 42
+        entries[0]["size"]["lz4"] = 0
         source.write_text(json.dumps(entries))
         self.run_cli("build")
-        self.assertEqual(self.index()["entries"][0]["shards"][0]["compressed"], ["zst"])
+        self.assertEqual(self.index()["entries"][0]["shards"][0]["size"], {
+            "raw": len(self.payload), "zst": 42, "lz4": 0,
+        })
         self.zipped.write_bytes(gzip.compress(self.payload))
         self.run_cli("scan", "primary", self.checkout)
+        before = self.snapshot()
         self.run_cli("scan", "primary", self.checkout)
-        self.assertEqual(json.loads(source.read_bytes())[0]["compressed"], ["zst", "gz"])
-        self.assertEqual(self.index()["entries"][0]["shards"][0]["compressed"], ["zst", "gz"])
+        self.assertEqual(before, self.snapshot())
+        sizes = {"raw": len(self.payload), "zst": 42, "lz4": 0, "gz": self.zipped.stat().st_size}
+        self.assertEqual(json.loads(source.read_bytes())[0]["size"], sizes)
+        self.assertEqual(self.index()["entries"][0]["shards"][0]["size"], sizes)
         self.run_cli("check")
         self.zipped.unlink()
         self.assert_scan_fails_without_publishing("advertised gzip is missing")
@@ -405,16 +516,16 @@ class IngestionTests(unittest.TestCase):
         self.ingest()
         source = self.root / "shards" / "primary.json"
         entries = json.loads(source.read_bytes())
-        entries[0].pop("compressed")
-        for field, value, message in (
-            ("gzip", True, "replace the gzip boolean with a compressed array"),
-            ("compression", ["gz"], "rename compression to compressed"),
+        for field, value in (
+            ("gzip", True), ("compression", ["gz"]), ("compressed", ["gz"]),
         ):
             with self.subTest(field=field):
                 entries[0][field] = value
                 source.write_text(json.dumps(entries))
                 result = self.run_cli("check", success=False)
-                self.assertIn(message, result.stderr)
+                self.assertIn(field, result.stderr)
+                self.assertIn("size", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
                 entries[0].pop(field)
 
     def test_interrupted_compression_never_publishes_partial_gzip(self):

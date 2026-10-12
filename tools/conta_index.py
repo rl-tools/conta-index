@@ -25,7 +25,7 @@ INDEX_LOCATION = "generated/index.json"
 VERSION_NAME = re.compile(r"^[1-9][0-9]*$")
 SHA1 = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
-COMPRESSED_EXTENSION = re.compile(r"^[a-z0-9]+$")
+FORMAT = re.compile(r"^[a-z0-9]+$")
 FIRST_INDEXED_AT = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 LFS_POINTER = b"version https://git-lfs"
 
@@ -77,17 +77,16 @@ def load_shard(shard):
             fail(f"{path}: bad digests in {entry}")
         if sha1 in seen:
             fail(f"{path}: {sha1} is listed twice")
-        if "gzip" in entry:
-            fail(f"{path}: replace the gzip boolean with a compressed array for {sha1}")
-        if "compression" in entry:
-            fail(f"{path}: rename compression to compressed for {sha1}")
-        compressed = entry.get("compressed", [])
-        if (not isinstance(compressed, list)
-                or any(not isinstance(extension, str) or not COMPRESSED_EXTENSION.fullmatch(extension) for extension in compressed)
-                or len(set(compressed)) != len(compressed)):
-            fail(f"{path}: compressed must be an array of unique lowercase alphanumeric extensions for {sha1}")
-        if "gzip" in compressed:
-            fail(f"{path}: use gz instead of gzip in compressed for {sha1}")
+        for legacy_field in ("gzip", "compression", "compressed"):
+            if legacy_field in entry:
+                fail(f"{path}: replace {legacy_field} with a size map for {sha1}")
+        size = entry.get("size")
+        if (not isinstance(size, dict) or "raw" not in size
+                or any(not FORMAT.fullmatch(format) for format in size)
+                or any(type(value) is not int or value < 0 for value in size.values())):
+            fail(f"{path}: size must be a map of lowercase alphanumeric formats to non-negative integer bytes, including raw, for {sha1}")
+        if "gzip" in size:
+            fail(f"{path}: use gz instead of gzip in size for {sha1}")
         if "first_indexed_at" in entry:
             timestamp = entry["first_indexed_at"]
             if not isinstance(timestamp, str) or not FIRST_INDEXED_AT.fullmatch(timestamp):
@@ -112,16 +111,18 @@ def save_shard(shard, entries):
 
 
 def first_indexed_dates(sources):
-    """Derive blob dates globally, without allowing a dated mirror to hide unknown history."""
+    """Validate blob identities and derive dates without hiding unknown history."""
     identities = {}
     earliest = {}
     unknown = set()
     for shard, entries in sources.items():
         for entry in entries:
             sha1 = entry["sha1"]
-            sha256, previous_shard = identities.setdefault(sha1, (entry["sha256"], shard))
+            sha256, raw_size, previous_shard = identities.setdefault(sha1, (entry["sha256"], entry["size"]["raw"], shard))
             if entry["sha256"] != sha256:
                 fail(f"{sha1}: sha256 differs between shards {previous_shard} and {shard}")
+            if entry["size"]["raw"] != raw_size:
+                fail(f"{sha1}: raw size differs between shards {previous_shard} and {shard}")
             if "first_indexed_at" not in entry:
                 unknown.add(sha1)
                 continue
@@ -140,7 +141,7 @@ def combine(shards):
     combined = {}
     for shard in shards:
         for entry in sources.get(shard, []):
-            location = {"id": shard, "compressed": entry.get("compressed", [])}
+            location = {"id": shard, "size": entry["size"]}
             existing = combined.get(entry["sha1"])
             if existing is None:
                 combined[entry["sha1"]] = {"sha1": entry["sha1"], "sha256": entry["sha256"], "shards": [location], "description": entry.get("description", "")}
@@ -215,8 +216,9 @@ def check():
 
 
 def digests(path, *, compressed=False):
-    """Hash original bytes, rejecting unmaterialized LFS files and invalid gzip."""
+    """Hash and count original bytes, rejecting LFS pointers and invalid gzip."""
     sha1, sha256 = hashlib.sha1(), hashlib.sha256()
+    size = 0
     try:
         with open(path, "rb") as file:
             prefix = file.read(len(LFS_POINTER))
@@ -228,14 +230,16 @@ def digests(path, *, compressed=False):
             for chunk in iter(lambda: file.read(1 << 20), b""):
                 sha1.update(chunk)
                 sha256.update(chunk)
+                size += len(chunk)
     except (OSError, EOFError, zlib.error) as error:
         fail(f"{path}: cannot read {'gzip blob' if compressed else 'blob'}: {error}")
-    return sha1.hexdigest(), sha256.hexdigest()
+    return sha1.hexdigest(), sha256.hexdigest(), size
 
 
 def verify_blob(path, expected, *, compressed=False):
     if digests(path, compressed=compressed) != expected:
-        fail(f"{path}: {'decompressed content' if compressed else 'content'} does not match expected sha1/sha256 {expected}")
+        fail(f"{path}: {'decompressed content' if compressed else 'content'} does not match expected sha1/sha256/size {expected}")
+    return path.stat().st_size
 
 
 def store_blob(source, destination, expected, *, compressed=False):
@@ -352,21 +356,24 @@ def scan(shard, checkout):
             warn(f"{path}: not a sha1-named blob, skipped")
             continue
         on_disk.add(name)
-        sha1, sha256 = digests(path)
+        sha1, sha256, raw_size = digests(path)
         if sha1 != name:
             fail(f"{path}: content hashes to {sha1}")
         if name not in entries:
-            entries[name] = {"sha1": sha1, "sha256": sha256, "description": ""}
+            entries[name] = {"sha1": sha1, "sha256": sha256, "description": "", "size": {"raw": raw_size}}
             additions.append(entries[name])
         elif entries[name]["sha256"] != sha256:
             fail(f"{path}: sha256 differs from shards/{shard}.json")
-        compressed = entries[name].setdefault("compressed", [])
+        size = entries[name]["size"]
+        if size["raw"] != raw_size:
+            fail(f"{path}: raw size differs from shards/{shard}.json")
         companion = data / f"{name}.gz"
         if companion.exists():
-            verify_blob(companion, (sha1, sha256), compressed=True)
-            if "gz" not in compressed:
-                compressed.append("gz")
-        elif "gz" in compressed:
+            gz_size = verify_blob(companion, (sha1, sha256, raw_size), compressed=True)
+            if "gz" in size and size["gz"] != gz_size:
+                fail(f"{companion}: gz size differs from shards/{shard}.json")
+            size["gz"] = gz_size
+        elif "gz" in size:
             fail(f"{companion}: advertised gzip is missing; shards are append-only")
         if name in descriptions:
             entries[name]["description"] = descriptions[name]
@@ -374,6 +381,10 @@ def scan(shard, checkout):
         warn(f"metadata.json lists {sha1} ({descriptions[sha1]}) but {data / sha1} does not exist")
     for sha1 in sorted(set(entries) - on_disk):
         fail(f"{sha1} is in shards/{shard}.json but missing from {data}: shards are append-only")
+    # Check mirror consistency before publishing the shard or generated files.
+    sources = {path.stem: load_shard(path.stem) for path in sorted(SHARDS.glob("*.json"))}
+    sources[shard] = list(entries.values())
+    first_indexed_dates(sources)
     if additions:
         timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
         for entry in additions:

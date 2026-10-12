@@ -40,8 +40,9 @@
             description: (entry.description || "").toLowerCase(),
             sha1: entry.sha1.toLowerCase(),
             sha256: entry.sha256.toLowerCase(),
-            downloads: (entry.shards || []).map(location => location.id).join(" ").toLowerCase(),
+            downloads: entry.shards.map(location => location.id).join(" ").toLowerCase(),
             first_indexed_at: entry.first_indexed_at || "",
+            size: entry.shards[0].size.raw,
           })),
         }))
         .catch(error => {
@@ -51,6 +52,21 @@
         .finally(() => clearTimeout(timeout));
     }
     return indexPromise;
+  }
+
+  function formatSize(bytes) {
+    const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let value = bytes;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit++;
+    }
+    return `${unit ? value.toFixed(2) : value} ${units[unit]}`;
+  }
+
+  function exactSize(bytes) {
+    return `${bytes} ${bytes === 1 ? "byte" : "bytes"}`;
   }
 
   function downloadURL(template, entry, extension = null) {
@@ -85,8 +101,8 @@
   function sortAndRender() {
     const compare = (a, b) => a < b ? -1 : a > b ? 1 : 0;
     matches.sort((a, b) => {
-      // Digests and UTC timestamps use lexical order; descriptions and shard names use natural order.
-      const order = sortColumn === "sha1" || sortColumn === "sha256" || sortColumn === "first_indexed_at"
+      // Digests, UTC timestamps and byte counts compare directly; descriptions and shard names use natural order.
+      const order = sortColumn === "sha1" || sortColumn === "sha256" || sortColumn === "first_indexed_at" || sortColumn === "size"
         ? compare(a[sortColumn], b[sortColumn])
         : naturalOrder.compare(a[sortColumn], b[sortColumn]);
       return (order || compare(a.sha1, b.sha1)) * sortDirection;
@@ -100,7 +116,7 @@
     const fragment = document.createDocumentFragment();
     const end = Math.min(shown + pageSize, matches.length);
     for (; shown < end; shown++) {
-      const { entry } = matches[shown];
+      const { entry, size } = matches[shown];
       const item = document.createElement("tr");
       const title = document.createElement("td");
       title.textContent = entry.description || "No description";
@@ -132,15 +148,22 @@
         cell.append(button);
         item.append(cell);
       }
+      const fileSize = document.createElement("td");
+      fileSize.className = "file-size";
+      fileSize.textContent = formatSize(size);
+      fileSize.title = exactSize(size);
+      item.append(fileSize);
       const links = document.createElement("td");
-      for (const location of entry.shards || []) {
-        for (const extension of [null, ...(location.compressed || [])]) {
+      for (const location of entry.shards) {
+        for (const format of ["raw", ...Object.keys(location.size).filter(key => key !== "raw")]) {
+          const bytes = location.size[format];
+          const extension = format === "raw" ? null : format;
           const url = downloadURL(shards?.[location.id]?.url, entry, extension);
           if (!url) continue;
           const link = document.createElement("a");
           link.href = url;
-          link.textContent = extension ? `${location.id} (.${extension})` : location.id;
-          link.title = `Download ${extension ? `.${extension}` : "raw"} from ${location.id}`;
+          link.textContent = `${location.id} (${extension ? `.${extension}, ` : ""}${formatSize(bytes)})`;
+          link.title = `Download ${extension ? `.${extension}` : "raw"} from ${location.id}: ${exactSize(bytes)}`;
           links.append(link);
         }
       }

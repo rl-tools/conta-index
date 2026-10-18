@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -272,6 +273,86 @@ class IngestionTests(unittest.TestCase):
         self.ingest("--no-gzip")
         self.assertEqual(before, self.snapshot())
         self.assertEqual(self.zipped.stat().st_mtime_ns, zipped_mtime)
+
+    def test_parallel_ingest_deduplicates_and_preserves_serial_output(self):
+        duplicate = self.root / "duplicate.bin"
+        duplicate.write_bytes(self.payload)
+        empty = self.root / "empty.bin"
+        empty.write_bytes(b"")
+        other = self.root / "other.bin"
+        other.write_bytes(bytes(range(256)) * 10000)
+        inputs = (self.input, duplicate, empty, other)
+        self.run_cli("ingest", "--jobs", "4", "primary", self.checkout, *inputs)
+        metadata_path = self.checkout / "metadata.json"
+        metadata = metadata_path.read_bytes()
+        self.assertEqual([entry["description"] for entry in json.loads(metadata)],
+                         [self.input.name, empty.name, other.name])
+        self.assertEqual(len(list(self.data.iterdir())), 6)
+        before = self.snapshot()
+        mtimes = {path: path.stat().st_mtime_ns for path in self.data.iterdir()}
+        self.run_cli("ingest", "-j", "2", "primary", self.checkout, *inputs)
+        self.assertEqual(metadata_path.read_bytes(), metadata)
+        self.assertEqual(before, self.snapshot())
+        self.assertEqual(mtimes, {path: path.stat().st_mtime_ns for path in self.data.iterdir()})
+        for jobs in (1, 4):
+            self.run_cli("scan", "--jobs", str(jobs), "primary", self.checkout)
+            self.assertEqual(before, self.snapshot())
+        mirror = self.root / "mirror"
+        self.run_cli("ingest", "mirror", mirror, *inputs)
+        self.assertEqual((mirror / "metadata.json").read_bytes(), metadata)
+        for path in self.data.iterdir():
+            self.assertEqual(path.read_bytes(), (mirror / "data" / path.name).read_bytes())
+        self.run_cli("check")
+
+    def test_ingestion_and_final_scan_actually_overlap_file_work(self):
+        other = self.root / "other.bin"
+        other.write_bytes(b"another blob")
+        other_raw = self.data / hashlib.sha1(other.read_bytes()).hexdigest()
+        concurrent_paths = {self.input, other, self.raw, other_raw}
+        barrier = threading.Barrier(2, timeout=10)
+        digests = INDEX.digests
+
+        def synchronized_digests(path, **kwargs):
+            if Path(path) in concurrent_paths:
+                # Both the initial hashing and final scan must run two files
+                # concurrently; a serial implementation times out at the barrier.
+                barrier.wait()
+            return digests(path, **kwargs)
+
+        with mock.patch.multiple(INDEX, ROOT=self.root, SHARDS=self.root / "shards",
+                                 VERSIONS=self.root / "version", CURRENT=self.root / "current.json"):
+            with mock.patch.object(INDEX, "digests", side_effect=synchronized_digests):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    INDEX.ingest("primary", self.checkout, [self.input, other], jobs=2)
+        self.assertEqual(len(self.index()["entries"]), 2)
+        self.run_cli("check")
+
+    def test_parallel_worker_failure_preserves_metadata_and_index(self):
+        self.ingest()
+        before = self.snapshot()
+        metadata = (self.checkout / "metadata.json").read_bytes()
+        self.zipped.write_bytes(b"corrupt")
+        other = self.root / "other.bin"
+        other.write_bytes(b"another blob")
+        for command, inputs in (("ingest", (self.input, other)), ("scan", ())):
+            with self.subTest(command=command):
+                result = self.run_cli(command, "--jobs", "2", "primary", self.checkout,
+                                      *inputs, success=False)
+                self.assertIn("not a gzip file", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+                self.assertEqual(before, self.snapshot())
+                self.assertEqual((self.checkout / "metadata.json").read_bytes(), metadata)
+                self.assertEqual(self.zipped.read_bytes(), b"corrupt")
+                self.assertEqual(list(self.data.glob(".ingest-*")), [])
+
+    def test_invalid_jobs_are_rejected_before_ingestion_or_scan(self):
+        for command, inputs in (("ingest", (self.input,)), ("scan", ())):
+            for jobs in ("0", "-1", "invalid"):
+                with self.subTest(command=command, jobs=jobs):
+                    result = self.run_cli(command, "--jobs", jobs, "primary", self.checkout,
+                                          *inputs, success=False)
+                    self.assertIn("jobs must be a positive integer", result.stderr)
+                    self.assertFalse(self.checkout.exists())
 
     def test_mixed_availability_uses_shard_preference_not_ingestion_order(self):
         mirror = self.root / "mirror-checkout"
@@ -540,6 +621,22 @@ class IngestionTests(unittest.TestCase):
                 INDEX.store_blob(self.raw, self.zipped, INDEX.digests(self.raw), compressed=True)
         self.assertFalse(self.zipped.exists())
         self.assertEqual(list(self.data.iterdir()), [self.raw])
+
+    def test_publication_survives_nfs_deferred_unlink(self):
+        self.data.mkdir(parents=True)
+        expected = INDEX.digests(self.input)
+
+        def defer_unlink(path, *, dir_fd=None):
+            # NFS can keep an unlinked file under a hidden name until the
+            # last filesystem reference closes, leaving its directory nonempty.
+            hidden = Path(path).with_name(".nfs-" + Path(path).name)
+            INDEX.os.rename(path, hidden, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+
+        for compressed, destination in ((False, self.raw), (True, self.zipped)):
+            with self.subTest(compressed=compressed):
+                with mock.patch.object(INDEX.os, "unlink", side_effect=defer_unlink):
+                    INDEX.store_blob(self.input, destination, expected, compressed=compressed)
+                self.assertEqual(INDEX.digests(destination, compressed=compressed), expected)
 
     def test_concurrent_publication_never_overwrites_existing_gzip(self):
         self.ingest("--no-gzip")

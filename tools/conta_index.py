@@ -5,6 +5,7 @@ build: for every version/<n>/, combine its shards.json with the shared shards/*.
 check: validate everything and fail if any generated file is stale, hand-edited or re-encoded."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import gzip
 import hashlib
@@ -247,8 +248,12 @@ def store_blob(source, destination, expected, *, compressed=False):
     if destination.exists():
         verify_blob(destination, expected, compressed=compressed)
         return
-    with tempfile.TemporaryDirectory(prefix=".ingest-", dir=destination.parent) as staging:
-        temporary = Path(staging) / destination.name
+    # Stage beside the destination: NFS may retain an unlinked file as .nfs*
+    # until its last reference closes, so removing a staging directory can fail.
+    descriptor, name = tempfile.mkstemp(prefix=".ingest-", dir=destination.parent)
+    os.close(descriptor)
+    temporary = Path(name)
+    try:
         if compressed:
             with open(source, "rb") as original, open(temporary, "wb") as output:
                 with gzip.GzipFile(filename="", mode="wb", fileobj=output, compresslevel=9, mtime=0) as zipped:
@@ -262,6 +267,8 @@ def store_blob(source, destination, expected, *, compressed=False):
             os.link(temporary, destination)
         except FileExistsError:
             verify_blob(destination, expected, compressed=compressed)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def descriptions_from_metadata(checkout):
@@ -308,14 +315,30 @@ def append_metadata(path, additions):
     read_json(path)
 
 
-def ingest(shard, checkout, files, *, compress=True):
+def parallel_map(function, items, jobs):
+    """Run file work concurrently, yielding results in input order."""
+    if jobs < 1:
+        raise ValueError("jobs must be a positive integer")
+    if jobs == 1:
+        yield from map(function, items)
+        return
+    # Hashing and zlib release the GIL; threads can use multiple CPU cores.
+    executor = ThreadPoolExecutor(max_workers=jobs)
+    try:
+        yield from executor.map(function, items)
+    finally:
+        # On failure, cancel queued work and let active atomic writes finish.
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def ingest(shard, checkout, files, *, compress=True, jobs=1):
     require_listed(shard)
     checkout = Path(checkout).expanduser().resolve()
     data = checkout / "data"
     data.mkdir(parents=True, exist_ok=True)
     descriptions = descriptions_from_metadata(checkout)
-    additions = []
-    for file in files:
+
+    def ingest_file(file):
         if not Path(file).is_file():
             fail(f"{file} is not a file")
         expected = digests(file)
@@ -324,6 +347,12 @@ def ingest(shard, checkout, files, *, compress=True):
         store_blob(file, blob, expected)
         if compress:
             store_blob(blob, data / f"{sha1}.gz", expected, compressed=True)
+        return file, sha1
+
+    additions = []
+    # Consume in argument order so duplicate inputs retain the first description
+    # regardless of which worker finishes first. Only this thread writes metadata.
+    for file, sha1 in parallel_map(ingest_file, files, jobs):
         description = description_for(file)
         if sha1 in descriptions:
             if descriptions[sha1] != description:
@@ -333,10 +362,22 @@ def ingest(shard, checkout, files, *, compress=True):
         additions.append((description, sha1))
     if additions:
         append_metadata(checkout / "metadata.json", additions)
-    scan(shard, checkout)
+    scan(shard, checkout, jobs=jobs)
 
 
-def scan(shard, checkout):
+def inspect_blob(path):
+    """Verify a raw blob and its optional gzip companion without changing metadata."""
+    sha1, sha256, raw_size = digests(path)
+    if sha1 != path.name:
+        fail(f"{path}: content hashes to {sha1}")
+    size = {"raw": raw_size}
+    companion = path.with_name(f"{path.name}.gz")
+    if companion.exists():
+        size["gz"] = verify_blob(companion, (sha1, sha256, raw_size), compressed=True)
+    return path, sha256, size
+
+
+def scan(shard, checkout, *, jobs=1):
     require_listed(shard)
     checkout = Path(checkout).expanduser().resolve()
     data = checkout / "data"
@@ -346,6 +387,7 @@ def scan(shard, checkout):
     entries = {entry["sha1"]: entry for entry in load_shard(shard)}
     additions = []
     on_disk = set()
+    paths = []
     for path in sorted(data.iterdir()):
         name = path.name
         if name.endswith(".gz") and SHA1.fullmatch(name[:-3]):
@@ -356,11 +398,12 @@ def scan(shard, checkout):
             warn(f"{path}: not a sha1-named blob, skipped")
             continue
         on_disk.add(name)
-        sha1, sha256, raw_size = digests(path)
-        if sha1 != name:
-            fail(f"{path}: content hashes to {sha1}")
+        paths.append(path)
+    for path, sha256, measured_size in parallel_map(inspect_blob, paths, jobs):
+        name = path.name
+        raw_size = measured_size["raw"]
         if name not in entries:
-            entries[name] = {"sha1": sha1, "sha256": sha256, "description": "", "size": {"raw": raw_size}}
+            entries[name] = {"sha1": name, "sha256": sha256, "description": "", "size": {"raw": raw_size}}
             additions.append(entries[name])
         elif entries[name]["sha256"] != sha256:
             fail(f"{path}: sha256 differs from shards/{shard}.json")
@@ -368,8 +411,8 @@ def scan(shard, checkout):
         if size["raw"] != raw_size:
             fail(f"{path}: raw size differs from shards/{shard}.json")
         companion = data / f"{name}.gz"
-        if companion.exists():
-            gz_size = verify_blob(companion, (sha1, sha256, raw_size), compressed=True)
+        if "gz" in measured_size:
+            gz_size = measured_size["gz"]
             if "gz" in size and size["gz"] != gz_size:
                 fail(f"{companion}: gz size differs from shards/{shard}.json")
             size["gz"] = gz_size
@@ -394,6 +437,16 @@ def scan(shard, checkout):
     build()
 
 
+def positive_jobs(value):
+    try:
+        jobs = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("jobs must be a positive integer") from None
+    if jobs < 1:
+        raise argparse.ArgumentTypeError("jobs must be a positive integer")
+    return jobs
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -410,6 +463,8 @@ def main():
                "Example:\n  python3 tools/conta_index.py ingest procthor ../conta-shards/procthor/ house.glb",
     )
     ingest_parser.add_argument("--no-gzip", action="store_true", help="do not create gzip companions (existing copies are still verified)")
+    ingest_parser.add_argument("-j", "--jobs", type=positive_jobs, default=1,
+                               help="number of parallel file workers, including the final scan (default: 1)")
     ingest_parser.add_argument("shard", metavar="<shard_name>", help="registered shard name from version/<n>/shards.json (e.g. procthor)")
     ingest_parser.add_argument("checkout", metavar="<local_checkout_path>", help="path to the local shard checkout (e.g. ../conta-shards/procthor/)")
     ingest_parser.add_argument("files", metavar="<file>", nargs="+", help="one or more source files to ingest")
@@ -422,13 +477,15 @@ def main():
     )
     scan_parser.add_argument("shard", metavar="<shard_name>", help="registered shard name from version/<n>/shards.json (e.g. procthor)")
     scan_parser.add_argument("checkout", metavar="<local_checkout_path>", help="path to the local shard checkout containing data/ (e.g. ../conta-shards/procthor/)")
+    scan_parser.add_argument("-j", "--jobs", type=positive_jobs, default=1,
+                             help="number of parallel verification workers (default: 1)")
     commands.add_parser("build", help="rebuild all index versions")
     commands.add_parser("check", help="validate generated indexes")
     args = parser.parse_args()
     if args.command == "ingest":
-        ingest(args.shard, args.checkout, args.files, compress=not args.no_gzip)
+        ingest(args.shard, args.checkout, args.files, compress=not args.no_gzip, jobs=args.jobs)
     elif args.command == "scan":
-        scan(args.shard, args.checkout)
+        scan(args.shard, args.checkout, jobs=args.jobs)
     else:
         globals()[args.command]()
 

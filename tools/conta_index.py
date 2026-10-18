@@ -5,7 +5,7 @@ build: for every version/<n>/, combine its shards.json with the shared shards/*.
 check: validate everything and fail if any generated file is stale, hand-edited or re-encoded."""
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import gzip
 import hashlib
@@ -32,7 +32,9 @@ LFS_POINTER = b"version https://git-lfs"
 
 
 def fail(message):
-    print(f"error: {message}", file=sys.stderr)
+    # Worker failures must start on a new line if a terminal progress bar is visible.
+    prefix = "\n" if sys.stderr.isatty() else ""
+    print(f"{prefix}error: {message}", file=sys.stderr)
     sys.exit(1)
 
 
@@ -315,8 +317,8 @@ def append_metadata(path, additions):
     read_json(path)
 
 
-def parallel_map(function, items, jobs):
-    """Run file work concurrently, yielding results in input order."""
+def parallel_map(function, items, jobs, *, ordered=True):
+    """Run file work concurrently, optionally yielding in completion order."""
     if jobs < 1:
         raise ValueError("jobs must be a positive integer")
     if jobs == 1:
@@ -325,13 +327,18 @@ def parallel_map(function, items, jobs):
     # Hashing and zlib release the GIL; threads can use multiple CPU cores.
     executor = ThreadPoolExecutor(max_workers=jobs)
     try:
-        yield from executor.map(function, items)
+        if ordered:
+            yield from executor.map(function, items)
+        else:
+            futures = [executor.submit(function, item) for item in items]
+            for future in as_completed(futures):
+                yield future.result()
     finally:
         # On failure, cancel queued work and let active atomic writes finish.
         executor.shutdown(wait=True, cancel_futures=True)
 
 
-def ingest(shard, checkout, files, *, compress=True, jobs=1):
+def ingest(shard, checkout, files, *, compress=True, jobs=1, progress=True):
     require_listed(shard)
     checkout = Path(checkout).expanduser().resolve()
     data = checkout / "data"
@@ -362,7 +369,7 @@ def ingest(shard, checkout, files, *, compress=True, jobs=1):
         additions.append((description, sha1))
     if additions:
         append_metadata(checkout / "metadata.json", additions)
-    scan(shard, checkout, jobs=jobs)
+    scan(shard, checkout, jobs=jobs, progress=progress)
 
 
 def inspect_blob(path):
@@ -377,7 +384,36 @@ def inspect_blob(path):
     return path, sha256, size
 
 
-def scan(shard, checkout, *, jobs=1):
+class ScanProgress:
+    """Render only from the coordinating thread, leaving redirected output clean."""
+
+    def __init__(self, total, *, enabled=True):
+        self.total = total
+        self.completed = 0
+        self.stream = sys.stderr
+        self.enabled = enabled and self.stream.isatty()
+
+    def render(self):
+        if self.enabled:
+            filled = 24 * self.completed // self.total if self.total else 24
+            percent = 100 * self.completed // self.total if self.total else 100
+            bar = "#" * filled + "-" * (24 - filled)
+            print(f"\rScan [{bar}] {self.completed}/{self.total} blobs ({percent:3d}%)", end="", file=self.stream, flush=True)
+
+    def advance(self):
+        self.completed += 1
+        self.render()
+
+    def __enter__(self):
+        self.render()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self.enabled:
+            print(file=self.stream, flush=True)
+
+
+def scan(shard, checkout, *, jobs=1, progress=True):
     require_listed(shard)
     checkout = Path(checkout).expanduser().resolve()
     data = checkout / "data"
@@ -399,27 +435,29 @@ def scan(shard, checkout, *, jobs=1):
             continue
         on_disk.add(name)
         paths.append(path)
-    for path, sha256, measured_size in parallel_map(inspect_blob, paths, jobs):
-        name = path.name
-        raw_size = measured_size["raw"]
-        if name not in entries:
-            entries[name] = {"sha1": name, "sha256": sha256, "description": "", "size": {"raw": raw_size}}
-            additions.append(entries[name])
-        elif entries[name]["sha256"] != sha256:
-            fail(f"{path}: sha256 differs from shards/{shard}.json")
-        size = entries[name]["size"]
-        if size["raw"] != raw_size:
-            fail(f"{path}: raw size differs from shards/{shard}.json")
-        companion = data / f"{name}.gz"
-        if "gz" in measured_size:
-            gz_size = measured_size["gz"]
-            if "gz" in size and size["gz"] != gz_size:
-                fail(f"{companion}: gz size differs from shards/{shard}.json")
-            size["gz"] = gz_size
-        elif "gz" in size:
-            fail(f"{companion}: advertised gzip is missing; shards are append-only")
-        if name in descriptions:
-            entries[name]["description"] = descriptions[name]
+    with ScanProgress(len(paths), enabled=progress) as bar:
+        for path, sha256, measured_size in parallel_map(inspect_blob, paths, jobs, ordered=False):
+            name = path.name
+            raw_size = measured_size["raw"]
+            if name not in entries:
+                entries[name] = {"sha1": name, "sha256": sha256, "description": "", "size": {"raw": raw_size}}
+                additions.append(entries[name])
+            elif entries[name]["sha256"] != sha256:
+                fail(f"{path}: sha256 differs from shards/{shard}.json")
+            size = entries[name]["size"]
+            if size["raw"] != raw_size:
+                fail(f"{path}: raw size differs from shards/{shard}.json")
+            companion = data / f"{name}.gz"
+            if "gz" in measured_size:
+                gz_size = measured_size["gz"]
+                if "gz" in size and size["gz"] != gz_size:
+                    fail(f"{companion}: gz size differs from shards/{shard}.json")
+                size["gz"] = gz_size
+            elif "gz" in size:
+                fail(f"{companion}: advertised gzip is missing; shards are append-only")
+            if name in descriptions:
+                entries[name]["description"] = descriptions[name]
+            bar.advance()
     for sha1 in sorted(set(descriptions) - on_disk):
         warn(f"metadata.json lists {sha1} ({descriptions[sha1]}) but {data / sha1} does not exist")
     for sha1 in sorted(set(entries) - on_disk):
@@ -463,6 +501,7 @@ def main():
                "Example:\n  python3 tools/conta_index.py ingest procthor ../conta-shards/procthor/ house.glb",
     )
     ingest_parser.add_argument("--no-gzip", action="store_true", help="do not create gzip companions (existing copies are still verified)")
+    ingest_parser.add_argument("--no-progress", action="store_true", help="hide the final scan's terminal progress bar")
     ingest_parser.add_argument("-j", "--jobs", type=positive_jobs, default=1,
                                help="number of parallel file workers, including the final scan (default: 1)")
     ingest_parser.add_argument("shard", metavar="<shard_name>", help="registered shard name from version/<n>/shards.json (e.g. procthor)")
@@ -477,15 +516,16 @@ def main():
     )
     scan_parser.add_argument("shard", metavar="<shard_name>", help="registered shard name from version/<n>/shards.json (e.g. procthor)")
     scan_parser.add_argument("checkout", metavar="<local_checkout_path>", help="path to the local shard checkout containing data/ (e.g. ../conta-shards/procthor/)")
+    scan_parser.add_argument("--no-progress", action="store_true", help="hide the terminal progress bar")
     scan_parser.add_argument("-j", "--jobs", type=positive_jobs, default=1,
                              help="number of parallel verification workers (default: 1)")
     commands.add_parser("build", help="rebuild all index versions")
     commands.add_parser("check", help="validate generated indexes")
     args = parser.parse_args()
     if args.command == "ingest":
-        ingest(args.shard, args.checkout, args.files, compress=not args.no_gzip, jobs=args.jobs)
+        ingest(args.shard, args.checkout, args.files, compress=not args.no_gzip, jobs=args.jobs, progress=not args.no_progress)
     elif args.command == "scan":
-        scan(args.shard, args.checkout, jobs=args.jobs)
+        scan(args.shard, args.checkout, jobs=args.jobs, progress=not args.no_progress)
     else:
         globals()[args.command]()
 

@@ -21,6 +21,45 @@ INDEX = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(INDEX)
 
 
+class TerminalOutput(io.StringIO):
+    def isatty(self):
+        return True
+
+
+class ScanProgressTests(unittest.TestCase):
+    def test_terminal_progress_includes_initial_final_and_empty_counts(self):
+        for total in (0, 3):
+            with self.subTest(total=total):
+                output = TerminalOutput()
+                with contextlib.redirect_stderr(output):
+                    with INDEX.ScanProgress(total) as progress:
+                        for _ in range(total):
+                            progress.advance()
+                text = output.getvalue()
+                self.assertIn(f"0/{total} blobs", text)
+                self.assertIn(f"{total}/{total} blobs (100%)", text)
+                self.assertTrue(text.endswith("\n"))
+
+    def test_redirected_or_disabled_progress_has_no_output(self):
+        for output, enabled in ((io.StringIO(), True), (TerminalOutput(), False)):
+            with self.subTest(terminal=output.isatty(), enabled=enabled):
+                with contextlib.redirect_stderr(output):
+                    with INDEX.ScanProgress(1, enabled=enabled) as progress:
+                        progress.advance()
+                self.assertEqual(output.getvalue(), "")
+
+    def test_interrupted_progress_ends_line_without_claiming_completion(self):
+        output = TerminalOutput()
+        with contextlib.redirect_stderr(output):
+            with self.assertRaises(KeyboardInterrupt):
+                with INDEX.ScanProgress(2) as progress:
+                    progress.advance()
+                    raise KeyboardInterrupt
+        self.assertIn("1/2 blobs", output.getvalue())
+        self.assertNotIn("100%", output.getvalue())
+        self.assertTrue(output.getvalue().endswith("\n"))
+
+
 class IngestionTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -353,6 +392,89 @@ class IngestionTests(unittest.TestCase):
                                           *inputs, success=False)
                     self.assertIn("jobs must be a positive integer", result.stderr)
                     self.assertFalse(self.checkout.exists())
+
+    def test_scan_progress_cli_serial_parallel_and_opt_out(self):
+        self.ingest()
+        before = self.snapshot()
+        mtimes = {path: path.stat().st_mtime_ns for path in self.data.iterdir()}
+        for command in ("scan", "ingest"):
+            for jobs in (1, 4):
+                for enabled in (True, False):
+                    with self.subTest(command=command, jobs=jobs, enabled=enabled):
+                        args = [str(SCRIPT), command, "--jobs", str(jobs), "primary", str(self.checkout)]
+                        if command == "ingest":
+                            args.append(str(self.input))
+                        if not enabled:
+                            args.append("--no-progress")
+                        output = TerminalOutput()
+                        stdout = io.StringIO()
+                        with mock.patch.multiple(INDEX, ROOT=self.root, SHARDS=self.root / "shards", VERSIONS=self.root / "version", CURRENT=self.root / "current.json"):
+                            with mock.patch.object(sys, "argv", args), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(output):
+                                INDEX.main()
+                        if enabled:
+                            self.assertIn("0/1 blobs (  0%)", output.getvalue())
+                            self.assertIn("1/1 blobs (100%)", output.getvalue())
+                            self.assertNotIn("2/2", output.getvalue())  # Gzip belongs to the same blob.
+                        else:
+                            self.assertEqual(output.getvalue(), "")
+                        self.assertNotIn("Scan [", stdout.getvalue())
+                        self.assertEqual(before, self.snapshot())
+                        self.assertEqual(mtimes, {path: path.stat().st_mtime_ns for path in self.data.iterdir()})
+        result = self.run_cli("scan", "primary", self.checkout)
+        self.assertEqual(result.stderr, "")  # Captured stderr is not a terminal.
+
+    def test_parallel_scan_progress_does_not_wait_for_first_input(self):
+        other = self.root / "other.bin"
+        other.write_bytes(b"another blob")
+        self.run_cli("ingest", "primary", self.checkout, self.input, other)
+        before = self.snapshot()
+        first = min(path for path in self.data.iterdir() if INDEX.SHA1.fullmatch(path.name))
+        updated = threading.Event()
+        first_finished = threading.Event()
+        inspect_blob = INDEX.inspect_blob
+        writers = []
+
+        class ProgressOutput(TerminalOutput):
+            def write(stream, text):
+                writers.append(threading.get_ident())
+                if "1/2 blobs" in text:
+                    self.assertFalse(first_finished.is_set())
+                    updated.set()
+                return super().write(text)
+
+        def delayed_inspect(path):
+            result = inspect_blob(path)
+            if path == first:
+                if not updated.wait(timeout=5):
+                    raise AssertionError("Progress waited for the first input instead of completed workers")
+                first_finished.set()
+            return result
+
+        output = ProgressOutput()
+        with mock.patch.multiple(INDEX, ROOT=self.root, SHARDS=self.root / "shards", VERSIONS=self.root / "version", CURRENT=self.root / "current.json"):
+            with mock.patch.object(INDEX, "inspect_blob", side_effect=delayed_inspect), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(output):
+                INDEX.scan("primary", self.checkout, jobs=2)
+        self.assertTrue(updated.is_set())
+        self.assertEqual(set(writers), {threading.get_ident()})
+        self.assertIn("2/2 blobs (100%)", output.getvalue())
+        self.assertEqual(before, self.snapshot())
+
+    def test_scan_progress_failure_keeps_errors_legible_and_does_not_publish(self):
+        self.ingest()
+        before = self.snapshot()
+        self.zipped.write_bytes(b"corrupt")
+        for jobs in (1, 4):
+            with self.subTest(jobs=jobs):
+                output = TerminalOutput()
+                with mock.patch.multiple(INDEX, ROOT=self.root, SHARDS=self.root / "shards", VERSIONS=self.root / "version", CURRENT=self.root / "current.json"):
+                    with contextlib.redirect_stderr(output), self.assertRaises(SystemExit):
+                        INDEX.scan("primary", self.checkout, jobs=jobs)
+                text = output.getvalue()
+                self.assertIn("\nerror:", text)
+                self.assertIn("not a gzip file", text)
+                self.assertNotIn("100%", text)
+                self.assertTrue(text.endswith("\n"))
+                self.assertEqual(before, self.snapshot())
 
     def test_mixed_availability_uses_shard_preference_not_ingestion_order(self):
         mirror = self.root / "mirror-checkout"

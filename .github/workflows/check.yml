@@ -5,7 +5,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: python3 -I -m unittest discover -s tests
+      - run: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
       - run: node --test tests/test_search.js
-      - run: python3 -I tools/conta_index.py check
+      - run: .venv/bin/conta index check
       - run: python3 -I tools/build_web.py

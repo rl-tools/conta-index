@@ -13,5 +13,10 @@
     "type": "huggingface",
     "url": "https://huggingface.co/datasets/conta-shards/hssd/resolve/main/data/{sha1}",
     "repo": "https://huggingface.co/datasets/conta-shards/hssd"
+  },
+  "viobench-public": {
+    "type": "huggingface",
+    "url": "https://huggingface.co/datasets/conta-shards/viobench-public/resolve/main/data/{sha1}",
+    "repo": "https://huggingface.co/datasets/conta-shards/viobench-public"
   }
 }

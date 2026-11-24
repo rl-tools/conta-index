@@ -18,5 +18,10 @@
     "type": "huggingface",
     "url": "https://huggingface.co/datasets/conta-shards/viobench-public/resolve/main/data/{sha1}",
     "repo": "https://huggingface.co/datasets/conta-shards/viobench-public"
+  },
+  "hyperdrone-originals": {
+    "type": "huggingface",
+    "url": "https://huggingface.co/datasets/conta-shards/hyperdrone-originals/resolve/main/data/{sha1}",
+    "repo": "https://huggingface.co/datasets/conta-shards/hyperdrone-originals"
   }
 }

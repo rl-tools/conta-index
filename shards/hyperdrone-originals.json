@@ -1,3 +1,4 @@
 [
+{"sha1": "edc4844529111a92755b95b3d845d61bb1faa04c", "sha256": "9d0c32f316c66352c3a10f6623428c182df60fab5b1dee15dc169ce181d98fd0", "description": "forest.glb", "size": {"raw": 68144984, "gz": 30739892}, "first_indexed_at": "2026-11-25T00:49:44Z"},
 {"sha1": "77d055df9fe567fd73201bd925647a65851b0642", "sha256": "93149f0fe773f38ea80d95ca1111dcda28ee7534e19d5eac74923487a0eb5db6", "description": "hyperdrone-originals/warehouse.glb", "size": {"raw": 1598152, "gz": 493511}, "first_indexed_at": "2026-11-24T23:23:41Z"}
 ]
